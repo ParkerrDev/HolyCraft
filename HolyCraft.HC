@@ -1,42 +1,23 @@
-// HolyCraft - a tiny voxel sandbox (Minecraft-ish) written in HolyC.
+//HolyCraft: walk a world of blocks, break them and place new ones.
+//W S A D walk, the mouse or J L I K look, Space jumps, G flies, R F rise
+//and sink, left click breaks, right click places, 1 to 9 and Q E pick a
+//block, Esc quits.
 //
-// Everything is CPU-bound (software rendering, single thread), so it is built for
-// speed: a per-pixel voxel raycaster (3D DDA, Amanatides & Woo) renders into a small
-// 8-bit indexed buffer in memory with NO host calls in the hot loop, then that buffer
-// is blitted scaled to fill the 640x480 screen each frame.
-//
-// Controls:  W/S move   A/D strafe   R/F up/down (toggle fly with G)   J/L turn   I/K look
-//            (in the browser you can also LOOK with the MOUSE)
-//            LEFT-click break · RIGHT-click place · 1..7 pick block · Esc quit
-//
-// Two build targets, picked by #ifdef TOS_NATIVE:
-//   default          -> holyc-wasm (the in-browser Games launcher): present via GrSprite,
-//                       look with the mouse, input via ScanChar/KeyGet.
-//   #define TOS_NATIVE -> real TempleOS (run from the C: disk in HEMU): renders through the
-//                       standard Fs->draw_it callback (like Demo/Games/Halogen.HC), input via
-//                       ScanMsg(MSG_KEY_DOWN); look with J/L/I/K or the arrow keys. A smaller
-//                       frame because the x86 emulator is much slower than native WASM.
+//Two builds. In the browser (HolyC-wasm) a ray a pixel draws the frame,
+//blitted with GrSprite. In TempleOS (Run.HC defines TOS_NATIVE) DrawIt
+//fills the exposed faces with GrFillPoly3 over a depth buffer.
 #ifdef TOS_NATIVE
-// The x86 emulator is MUCH slower than native WASM, so the native build is tuned HARD for frame rate.
-// RES 80x59 x SCALE 8 == 640x472 EXACTLY (the maximized borderless window minus the 8px menu bar), and
-// 80/59 == 640/472 so the aspect is exact (no distortion). The integer block-fill (DrawIt) then reads
-// each of the 4720 source pixels ONCE and writes its 8x8 block - ~3x cheaper than per-pixel scaling,
-// which read all ~302K screen pixels every OS refresh and was the real "barely crawling" cost.
-// 80×59 ×8 == 640×472 (the maximized window), 80/59 == 640/472 -> exact aspect, square pixels.
-// Finer resolutions are too heavy for the per-pixel software raycaster even split across all 4 SMP
-// cores (160×118 measured ~3fps), so this is the resolution/fps sweet spot in the x86 emulator.
-#define RES_W   640          // FULL native resolution - NO downscaling (1 framebuffer px = 1 screen px).
-#define RES_H   472          // the maximized borderless window is 640x472 (top 8px = OS menu bar).
-#define SCALE   1            // SLOW in the x86 emulator for now; per the user, optimize the emulator later.
-#define RDIST   32.0         // render distance (WORLD units)
-#define MAXSTEP 80           // DDA step cap (>= steps to reach RDIST diagonally)
+#define RDIST		32.0	//Render distance, cells.
+#define FOG0		20.0	//Fog starts here and is all sky at RDIST.
 #else
-#define RES_W   640          // full 640x480 in the browser too (native WASM is fast enough), SCALE 1
-#define RES_H   480
-#define SCALE   1
-#define RDIST   36.0         // render distance (WORLD units)
-#define MAXSTEP 110          // DDA step cap per ray
+#define RES_W		640
+#define RES_H		480
+#define SCALE		1
+#define RDIST		48.0
+#define FOG0		32.0
+#define SKY_K		2.0	//Sky ramp steps a unit of elevation sine.
 #endif
+#define FOV		1.05	//Half the view's height at distance 1.
 #define WX      128           // world size
 #define WZ      128
 #define WY      40
@@ -56,9 +37,7 @@
 #define FALL_MAX	21.0
 
 U8  *g_world = NULL;         // WX*WZ*WY voxels, 0 = air
-U8  *g_fb    = NULL;         // RES_W*RES_H indexed frame - RenderFrame/DrawHUD's render target
-U8  *g_show  = NULL;         // the published frame DrawIt reads (native: a 2nd buffer, swapped each
-                            // frame so DrawIt never blits a half-rendered frame; browser: == g_fb)
+U8  *g_fb    = NULL;         //The browser's frame, RES_W*RES_H.
 U8   g_skyr[3];             // sky gradient ramp (blue zenith -> ltblue -> ltcyan horizon)
 U8   g_lr[24*4];            // per-block ramp, 4 levels dark->bright. 0=air; 1-7 materials; 8-23 = the 16 system colors
 U8   g_flo[24*6], g_fhi[24*6]; // per (block,face): the 2 ramp colors bracketing that face's light shade
@@ -215,12 +194,10 @@ U0 Init()
   g_tjl=0; g_tjr=0; g_tpu=0; g_tpd=0;
   g_world = MAlloc(WX*WZ*WY);
   g_hm    = MAlloc(WX*WZ);
-  g_fb    = MAlloc(RES_W*RES_H);
 #ifdef TOS_NATIVE
-  g_show  = MAlloc(RES_W*RES_H);   // second buffer: tear-free hand-off to DrawIt
-  g_depth = MAlloc(g_depthcap*sizeof(I32));   // face-rasterizer z-buffer (attached to the screen DC each frame)
+  g_depth=MAlloc(g_depthcap*sizeof(I32));
 #else
-  g_show  = g_fb;
+  g_fb=MAlloc(RES_W*RES_H);
 #endif
   SetRamp();
   BuildFaceShades();
@@ -237,147 +214,17 @@ U0 Init()
   g_tick_t=tS;
 }
 
-// ----- the renderer: one 3D-DDA ray per pixel into g_fb. On SMP the scanlines are SPLIT across all
-//       CPU cores (the TempleOS JobQue pattern, like Demo/Graphics/PredatorPrey.HC) -> ~Nx the fps. -----
-// camera basis, computed once per frame into globals so every core's slice reads the same view.
-F64 g_fwx,g_fwy,g_fwz, g_rgx,g_rgz, g_upx,g_upy,g_upz, g_cox,g_coy,g_coz;
+F64 g_fwx,g_fwy,g_fwz,g_rgx,g_rgz,g_upx,g_upy,g_upz,g_cox,g_coy,g_coz;
 I64 g_bix,g_biy,g_biz;
-#ifdef TOS_NATIVE
-I64 g_mpdone;                  // SMP: one bit per core, cleared (atomically) when that core's rows are done
-#endif
 
 U0 SetupCam()
-{
-  F64 cp=Cos(g_pitch), sp=Sin(g_pitch), cy=Cos(g_yaw), sy=Sin(g_yaw);
-  g_fwx=sy*cp; g_fwy=sp;  g_fwz=cy*cp;        // forward
-  g_rgx=cy;               g_rgz=-sy;          // right (rgy is always 0)
-  g_upx=-sy*sp; g_upy=cp; g_upz=-cy*sp;       // up
+{//One frame's eye and view: forward, right (no y) and up.
+  F64 cp=Cos(g_pitch),sp=Sin(g_pitch),cy=Cos(g_yaw),sy=Sin(g_yaw);
   g_cox=g_px; g_coy=g_py; g_coz=g_pz;
-  g_bix=Floor(g_px); g_biy=Floor(g_py); g_biz=Floor(g_pz);
-}
-
-U0 RenderRows(I64 y0, I64 y1)                 // render scanlines [y0,y1) into g_fb (reads the basis globals)
-{
-  F64 fwx=g_fwx,fwy=g_fwy,fwz=g_fwz, rgx=g_rgx,rgz=g_rgz, upx=g_upx,upy=g_upy,upz=g_upz;
-  F64 fov=1.05, asp=1.0*RES_W/RES_H;          // wider field of view (was 0.85)
-  F64 ox=g_cox, oy=g_coy, oz=g_coz;
-  I64 bix=g_bix, biy=g_biy, biz=g_biz;
-  I64 sx,syy;
-  // LIVE "static" dither RNG (a 64-bit LCG). Seeded from g_frame so the noise re-randomizes every frame
-  // (animated, like TempleOS's RandU16 probability dither / the Varoom car), and from y0 so SMP slices differ.
-  U64 rng = (g_frame*2654435761 + y0*2246822519 + 12345) | 1;
-  for (syy=y0; syy<y1; syy++) {
-    F64 vy=(1.0 - 2.0*syy/RES_H)*fov;
-#ifdef TOS_NATIVE
-    vy = -vy;   // real TempleOS HolyC renders the vertical ray sweep INVERTED vs holyc-wasm (the camera
-                // up-vector contribution comes out negated; Sin/Cos/the vy formula all verify correct in
-                // isolation, so it's a codegen difference). Flip it here so the native world is right-side up.
-#endif
-    F64 bx=fwx+upx*vy, by=fwy+upy*vy, bz=fwz+upz*vy;   // row base dir (cx=0)
-    F64 cstep=2.0/RES_W*asp*fov;
-    F64 cx=-asp*fov;
-    I64 row=syy*RES_W;
-    // per-row sky gradient: position in the 3-colour ramp + dither probability toward the next colour
-    F64 skp=2.0*syy/RES_H; if (skp>1.999) skp=1.999;
-    I64 sklv=skp, skb=g_skyr[sklv], skb2=g_skyr[sklv+1];
-    I64 skthr=(skp-sklv)*65536.0;
-    for (sx=0; sx<RES_W; sx++) {
-      F64 dx=bx+rgx*cx, dy=by, dz=bz+rgz*cx;
-      cx+=cstep;
-      F64 ln=Sqrt(dx*dx+dy*dy+dz*dz);   // normalize so t == true world distance
-      dx=dx/ln; dy=dy/ln; dz=dz/ln;     // (else fog/render-distance wobble per column -> sky strips)
-      // 3D DDA setup
-      I64 ix=bix, iy=biy, iz=biz;
-      F64 adx=Abs(dx), ady=Abs(dy), adz=Abs(dz);
-      I64 stx,sty,stz;
-      F64 tdx,tdy,tdz, tmx,tmy,tmz;
-      if (dx>0.0) { stx=1;  tdx=1.0/adx; tmx=(ix+1-ox)*tdx; }
-      else if (dx<0.0){ stx=-1; tdx=1.0/adx; tmx=(ox-ix)*tdx; }
-      else { stx=0; tdx=1000000.0; tmx=1000000.0; }
-      if (dy>0.0) { sty=1;  tdy=1.0/ady; tmy=(iy+1-oy)*tdy; }
-      else if (dy<0.0){ sty=-1; tdy=1.0/ady; tmy=(oy-iy)*tdy; }
-      else { sty=0; tdy=1000000.0; tmy=1000000.0; }
-      if (dz>0.0) { stz=1;  tdz=1.0/adz; tmz=(iz+1-oz)*tdz; }
-      else if (dz<0.0){ stz=-1; tdz=1.0/adz; tmz=(oz-iz)*tdz; }
-      else { stz=0; tdz=1000000.0; tmz=1000000.0; }
-      I64 axis=1, hit=0, bt=0, step;
-      F64 t=0.0;
-      for (step=0; step<MAXSTEP; step++) {
-        if (tmx<tmy && tmx<tmz) { ix+=stx; t=tmx; tmx+=tdx; axis=0; }
-        else if (tmy<tmz)       { iy+=sty; t=tmy; tmy+=tdy; axis=1; }
-        else                    { iz+=stz; t=tmz; tmz+=tdz; axis=2; }
-        if (t>RDIST) break;
-        if (ix<0||ix>=WX||iz<0||iz>=WZ||iy<0||iy>=WY) break;
-        bt=g_world[ix + WX*(iz + WZ*iy)];   // WIdx() inlined: TempleOS HolyC doesn't inline, and a CALL per
-        if (bt) { hit=1; break; }            // DDA step (~millions/frame) is brutal in the x86 emulator
-      }
-      rng = rng*6364136223846793005 + 1442695040888963407;   // advance the LCG (one random value per pixel)
-      I64 rv = (rng>>48)&0xFFFF, col;                         // 0..65535
-      if (hit) {
-        // which of the 6 cube faces (DDA step axis + sign) -> its precomputed light-direction shade,
-        // then a LIVE probability dither (rv<threshold) blends toward the brighter ramp colour.
-        // (no ternary -- real TempleOS HolyC has none; holyc-wasm tolerates it but the OS compiler errors.)
-        I64 faceid;
-        if (axis==0)      { if (stx>0) faceid=0; else faceid=1; }   // hit -X vs +X face
-        else if (axis==1) { if (sty>0) faceid=2; else faceid=3; }   // -Y (bottom) vs +Y (top)
-        else              { if (stz>0) faceid=4; else faceid=5; }   // -Z vs +Z
-        I64 k=bt*6+faceid;
-        if (rv < g_fthr[k]) col=g_fhi[k]; else col=g_flo[k];
-      } else if (rv < skthr) col=skb2; else col=skb;          // sky gradient (also dithered)
-      g_fb[row+sx]=col;
-    }
-  }
-}
-
-#ifdef TOS_NATIVE
-I64 RenderSlice(U8 *data)        // a Seth job: render THIS core's band of scanlines, then clear its flag bit
-{
-  I64 n=Gs->num;                 // the core this job runs on (0..mp_cnt-1) == its slice index
-  RenderRows(n*RES_H/mp_cnt, (n+1)*RES_H/mp_cnt);
-  LBtr(&g_mpdone, n);            // atomic: signal "core n done" (releases this core's pixel writes)
-  return 0;
-}
-#endif
-
-U0 RenderFrame()
-{
-  g_frame++;                       // advance the live-dither seed so the "static" re-randomizes each frame
-  SetupCam();
-#ifdef TOS_NATIVE
-  if (mp_cnt>1) {                // SMP: hand each core a horizontal band, wait for all (PredatorPrey pattern)
-    I64 i, spins=0;
-    g_mpdone=(1<<mp_cnt)-1;      // one set bit per core
-    for (i=0; i<mp_cnt; i++) JobQue(&RenderSlice, NULL, i);
-    do { Yield; spins++; } while (g_mpdone && spins<400000);   // wait for every slice (cap so a lost job never hangs)
-    LBts(&g_mpdone,31); LBtr(&g_mpdone,31);                    // atomic fence: acquire all cores' pixel writes before we read g_fb
-  } else
-    RenderRows(0, RES_H);
-#else
-  RenderRows(0, RES_H);
-#endif
-}
-
-U0 DrawHUD()
-{
-  I64 cx=RES_W/2, cy=RES_H/2, i;
-  I64 aw=RES_W/110, t; if (aw<4) aw=4;                       // crosshair = a Latin (Christian) cross: short top + crossbar, long lower stem; you aim at the crossing
-  for (t=0; t<2; t++) {                                       // 2px thick
-    for (i=-aw; i<=aw*3; i++) g_fb[(cy+i)*RES_W + cx+t]=15;   // vertical stem (top stub aw, lower stem 3aw)
-    for (i=-aw; i<=aw;   i++) g_fb[(cy+t)*RES_W + cx+i]=15;   // crossbar (near the top)
-  }
-  // hotbar: 7 swatches along the bottom, sized RELATIVE to the resolution (so it isn't huge at low res
-  // or invisible at high res). gap framing inside each cell; selected one framed white.
-  I64 nb=16, bw=RES_W/17, gap=bw/8, b;                       // 16 placeable blocks = the palette colours (8..23)
-  if (gap<1) gap=1;
-  I64 bh=bw*3/4, x0=(RES_W-nb*bw)/2, y0=RES_H-bh-bh/3;       // squarish swatches near the bottom
-  for (b=0; b<nb; b++) {
-    I64 blk=8+b, px=x0+b*bw, py, qx;
-    I64 c=g_lr[blk*4+2];                                     // representative shade of the colour block
-    for (py=y0; py<y0+bh; py++)
-      for (qx=px+gap; qx<px+bw-gap; qx++) g_fb[py*RES_W+qx]=c;
-    if (blk==g_sel)
-      for (qx=px-1; qx<px+bw; qx++) { g_fb[(y0-1)*RES_W+qx]=15; g_fb[(y0+bh)*RES_W+qx]=15; }
-  }
+  g_fwx=sy*cp; g_fwy=sp; g_fwz=cy*cp;
+  g_rgx=cy; g_rgz=-sy;
+  g_upx=-sy*sp; g_upy=cp; g_upz=-cy*sp;
+  g_bix=Floor(g_cox); g_biy=Floor(g_coy); g_biz=Floor(g_coz);
 }
 
 // raycast from the camera center to the first solid voxel; returns hit + the
@@ -733,6 +580,201 @@ U0 DrawIt(CTask *task, CDC *dc)
   DrawHUDDC(dc);
 }
 #else
+F64 g_ent_t0,g_ent_t1;
+I64 g_ent_axis,g_ent_ix,g_ent_iy,g_ent_iz;
+
+U0 SlabCut(F64 o,F64 d,I64 size,I64 axis)
+{//Narrows g_ent_t0 to g_ent_t1 to where o+d*t lies in 0 to size.
+  F64 t1,t2;
+  if (!d) {
+    if (!(0<=o<size))
+      g_ent_t1=-1.0;
+  } else {
+    t1=-o/d;
+    t2=(size-o)/d;
+    if (d<0) {
+      t2=t1;
+      t1=(size-o)/d;
+    }
+    if (t1>g_ent_t0) {
+      g_ent_t0=t1;
+      g_ent_axis=axis;
+    }
+    if (t2<g_ent_t1)
+      g_ent_t1=t2;
+  }
+}
+
+Bool RayEnter(F64 dx,F64 dy,F64 dz,F64 tlim)
+{//Where a ray from an eye outside the world meets it before tlim.
+  g_ent_t0=0.0;
+  g_ent_t1=tlim;
+  g_ent_axis=1;
+  SlabCut(g_cox,dx,WX,0);
+  SlabCut(g_coy,dy,WY,1);
+  SlabCut(g_coz,dz,WZ,2);
+  if (g_ent_t0>g_ent_t1)
+    return FALSE;
+  g_ent_ix=ClampI64(Floor(g_cox+dx*g_ent_t0),0,WX-1);
+  g_ent_iy=ClampI64(Floor(g_coy+dy*g_ent_t0),0,WY-1);
+  g_ent_iz=ClampI64(Floor(g_coz+dz*g_ent_t0),0,WZ-1);
+  return TRUE;
+}
+
+U0 RenderFrame()
+{//A ray a pixel into g_fb. Far blocks fade into the sky.
+  F64 asp=1.0*RES_W/RES_H,cstep=2.0/RES_W*asp*FOV,fog_k=65536.0/(RDIST-FOG0),
+	rgx,rgz,fx0,fx1,fy0,fy1,fz0,fz1,vy,bx,by,bz,row2,cx,
+	dx,dy,dz,len2,inv,tlim,tdx,tdy,tdz,tmx,tmy,tmz,t,dist,s;
+  I64 sx,sy,ix,iy,iz,ex,ey,ez,stx,sty,stz,sdy,sdz,fxf,fyf,fzf,
+	idx,bidx,bt,b0=0,face,k,lv,rv,rv2,col;
+  U8 *world=g_world,*fb=g_fb;
+  U64 rng;
+  Bool out;
+  g_frame++;
+  SetupCam;
+  rgx=g_rgx; rgz=g_rgz;
+  rng=g_frame*2654435761+12345;
+  rng|=1;
+  out=!(0<=g_cox<WX && 0<=g_coy<WY && 0<=g_coz<WZ);
+  bidx=g_bix+WX*(g_biz+WZ*g_biy);
+  if (!out)
+    b0=world[bidx];
+  fx1=g_bix+1-g_cox; fx0=g_cox-g_bix;
+  fy1=g_biy+1-g_coy; fy0=g_coy-g_biy;
+  fz1=g_biz+1-g_coz; fz0=g_coz-g_biz;
+  for (sy=0;sy<RES_H;sy++) {
+    vy=(1.0-2.0*sy/RES_H)*FOV;
+    bx=g_fwx+g_upx*vy;
+    by=g_fwy+g_upy*vy;
+    bz=g_fwz+g_upz*vy;
+    row2=1.0+vy*vy;
+    cx=-asp*FOV;
+    inv=1.0/Sqrt(row2+cx*cx);
+    for (sx=0;sx<RES_W;sx++) {
+      dx=bx+rgx*cx;
+      dy=by;
+      dz=bz+rgz*cx;
+      len2=row2+cx*cx;
+      inv*=1.5-0.5*len2*inv*inv; //Newton from the last pixel's 1/length.
+      tlim=RDIST*inv;
+      cx+=cstep;
+      if (dx>0) {
+	stx=1; ex=WX; fxf=0; tdx=1.0/dx; tmx=fx1*tdx;
+      } else if (dx<0) {
+	stx=-1; ex=-1; fxf=1; tdx=-1.0/dx; tmx=fx0*tdx;
+      } else {
+	stx=0; ex=0; fxf=1; tdx=0; tmx=1000000.0;
+      }
+      if (dy>0) {
+	sty=1; ey=WY; sdy=WX*WZ; fyf=2; tdy=1.0/dy; tmy=fy1*tdy;
+      } else if (dy<0) {
+	sty=-1; ey=-1; sdy=-WX*WZ; fyf=3; tdy=-1.0/dy; tmy=fy0*tdy;
+      } else {
+	sty=0; ey=0; sdy=0; fyf=3; tdy=0; tmy=1000000.0;
+      }
+      if (dz>0) {
+	stz=1; ez=WZ; sdz=WX; fzf=4; tdz=1.0/dz; tmz=fz1*tdz;
+      } else if (dz<0) {
+	stz=-1; ez=-1; sdz=-WX; fzf=5; tdz=-1.0/dz; tmz=fz0*tdz;
+      } else {
+	stz=0; ez=0; sdz=0; fzf=5; tdz=0; tmz=1000000.0;
+      }
+      ix=g_bix; iy=g_biy; iz=g_biz; idx=bidx;
+      t=0; bt=b0; face=fyf;
+      if (out) {
+	if (RayEnter(dx,dy,dz,tlim)) {
+	  ix=g_ent_ix; iy=g_ent_iy; iz=g_ent_iz;
+	  idx=ix+WX*(iz+WZ*iy);
+	  t=g_ent_t0;
+	  bt=world[idx];
+	  if (!g_ent_axis)
+	    face=fxf;
+	  else if (g_ent_axis==2)
+	    face=fzf;
+	  if (stx>0) tmx=(ix+1-g_cox)*tdx;
+	  if (stx<0) tmx=(g_cox-ix)*tdx;
+	  if (sty>0) tmy=(iy+1-g_coy)*tdy;
+	  if (sty<0) tmy=(g_coy-iy)*tdy;
+	  if (stz>0) tmz=(iz+1-g_coz)*tdz;
+	  if (stz<0) tmz=(g_coz-iz)*tdz;
+	} else
+	  t=tlim+1;
+      }
+      while (!bt && t<=tlim) {
+	if (tmx<tmy && tmx<tmz) {
+	  ix+=stx;
+	  if (ix==ex) break;
+	  t=tmx; tmx+=tdx; idx+=stx; face=fxf;
+	} else if (tmy<tmz) {
+	  iy+=sty;
+	  if (iy==ey) break;
+	  t=tmy; tmy+=tdy; idx+=sdy; face=fyf;
+	} else {
+	  iz+=stz;
+	  if (iz==ez) break;
+	  t=tmz; tmz+=tdz; idx+=sdz; face=fzf;
+	}
+	bt=world[idx];
+      }
+      rng=rng*6364136223846793005+1442695040888963407;
+      rv=rng>>48;
+      if (bt) {
+	dist=t*len2*inv;
+	if (dist>FOG0) {
+	  rv2=rng>>32&0xFFFF;
+	  if ((dist-FOG0)*fog_k>rv2)
+	    bt=0;
+	}
+      }
+      if (bt) {
+	k=bt*6+face;
+	if (rv<g_fthr[k])
+	  col=g_fhi[k];
+	else
+	  col=g_flo[k];
+      } else {
+	s=2.0-dy*inv*SKY_K;
+	if (s<=0)
+	  col=g_skyr[0];
+	else if (s>=2)
+	  col=g_skyr[2];
+	else {
+	  lv=s;
+	  if (rv<(s-lv)*65536)
+	    col=g_skyr[lv+1];
+	  else
+	    col=g_skyr[lv];
+	}
+      }
+      *fb++=col;
+    }
+  }
+}
+
+U0 DrawHUD()
+{
+  I64 cx=RES_W/2, cy=RES_H/2, i;
+  I64 aw=RES_W/110, t; if (aw<4) aw=4;                       // crosshair = a Latin (Christian) cross: short top + crossbar, long lower stem; you aim at the crossing
+  for (t=0; t<2; t++) {                                       // 2px thick
+    for (i=-aw; i<=aw*3; i++) g_fb[(cy+i)*RES_W + cx+t]=15;   // vertical stem (top stub aw, lower stem 3aw)
+    for (i=-aw; i<=aw;   i++) g_fb[(cy+t)*RES_W + cx+i]=15;   // crossbar (near the top)
+  }
+  // hotbar: 7 swatches along the bottom, sized RELATIVE to the resolution (so it isn't huge at low res
+  // or invisible at high res). gap framing inside each cell; selected one framed white.
+  I64 nb=16, bw=RES_W/17, gap=bw/8, b;                       // 16 placeable blocks = the palette colours (8..23)
+  if (gap<1) gap=1;
+  I64 bh=bw*3/4, x0=(RES_W-nb*bw)/2, y0=RES_H-bh-bh/3;       // squarish swatches near the bottom
+  for (b=0; b<nb; b++) {
+    I64 blk=8+b, px=x0+b*bw, py, qx;
+    I64 c=g_lr[blk*4+2];                                     // representative shade of the colour block
+    for (py=y0; py<y0+bh; py++)
+      for (qx=px+gap; qx<px+bw-gap; qx++) g_fb[py*RES_W+qx]=c;
+    if (blk==g_sel)
+      for (qx=px-1; qx<px+bw; qx++) { g_fb[(y0-1)*RES_W+qx]=15; g_fb[(y0+bh)*RES_W+qx]=15; }
+  }
+}
+
 U0 Present(CDC *dc)
 {
   GrSprite(dc, 0, 0, g_fb, RES_W, RES_H, SCALE);   // holyc-wasm blits the 8-bit buffer
