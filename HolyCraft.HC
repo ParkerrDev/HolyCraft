@@ -41,9 +41,19 @@
 #define WZ      128
 #define WY      40
 #define WATER   5
-#define EYE     1.62         // eye height above the feet
-#define GRAV    0.050        // gravity per frame (HIGH -> fast, snappy jump arc to suit the low emulator fps)
-#define JUMP    0.46         // jump impulse (~2-block jump but a much shorter air time than the old 0.020/0.33)
+#define EYE		1.62	//Eye above the feet.
+#define PLAYER_R	0.3	//Half the width of the player's box.
+#define PLAYER_TOP	0.2	//Top of the box above the eye.
+#define BOX_EPS		0.001	//Shrinks the box, so touching is not hitting.
+#define TICK		(1.0/60)	//Physics step, seconds.
+#define WALK_SPD	4.8	//Cells a second.
+#define FLY_SPD		4.8
+#define TURN_SPD	2.1	//Radians a second, J L I K.
+#define MS_TURN		0.003	//Radians a mouse step.
+#define PITCH_MAX	1.45
+#define GRAV		45.0	//Cells a second squared.
+#define JUMP_V		13.4	//Clears one block.
+#define FALL_MAX	21.0
 
 U8  *g_world = NULL;         // WX*WZ*WY voxels, 0 = air
 U8  *g_fb    = NULL;         // RES_W*RES_H indexed frame - RenderFrame/DrawHUD's render target
@@ -63,11 +73,9 @@ I64  g_plb  = 0, g_prb = 0;  // previous mouse button states (edge detect)
 // holyc-wasm fills these globals from the focused canvas's shared input state.
 I64 BrowserMouseCapture=0, BrowserMouseDX=0, BrowserMouseDY=0;
 U8 BrowserKeys[128];
-// Per-frame movement state, assigned from held keys before physics.
-I64  g_tf,g_tb,g_tl,g_tr,g_tu,g_td,g_tjl,g_tjr,g_tpu,g_tpd;
-F64  g_vy = 0.0;             // vertical velocity (gravity)
-I64  g_fly = 0;             // creative fly toggle ('g')
-I64  g_onground = 0, g_quit = 0;
+I64 g_tf,g_tb,g_tl,g_tr,g_tu,g_td,g_tjl,g_tjr,g_tpu,g_tpd; //Keys held.
+F64 g_vy=0.0,g_tick_t; //Up speed, and the time of the last physics tick.
+I64 g_fly=0,g_onground=0,g_quit=0;
 #ifdef TOS_NATIVE
 // native face-rasterizer state (declared before Init, which allocates g_depth). CDC is an OS type, so
 // these stay inside TOS_NATIVE (the browser/holyc-wasm target never sees them).
@@ -218,11 +226,15 @@ U0 Init()
   BuildFaceShades();
   GenWorld();
   BuildHM();
-  // spawn standing in the middle: drop in from just above the ground, gravity settles you
-  g_px = WX/2 + 0.5; g_pz = WZ/2 + 0.5;
-  g_py = HeightAt(WX/2, WZ/2) + EYE;
-  g_vy = 0.0; g_fly = 0; g_onground = 1;
-  g_yaw = 0.7; g_pitch = -0.06;
+  g_px=WX/2+0.5;
+  g_pz=WZ/2+0.5;
+  g_py=g_hm[WX/2+WX*(WZ/2)]+1+EYE;
+  g_vy=0.0;
+  g_fly=0;
+  g_onground=TRUE;
+  g_yaw=0.7;
+  g_pitch=-0.06;
+  g_tick_t=tS;
 }
 
 // ----- the renderer: one 3D-DDA ray per pixel into g_fb. On SMP the scanlines are SPLIT across all
@@ -394,59 +406,122 @@ I64 PickTarget()
   return 0;
 }
 
-I64 PlayerHits(F64 fx, F64 fy, F64 fz)
-{//does the player (eye at fx,fy,fz; ~1.7 tall) overlap a solid voxel?
-  I64 cx=Floor(fx), cz=Floor(fz);
-  if (Solid(cx, Floor(fy-EYE),     cz)) return 1;   // feet
-  if (Solid(cx, Floor(fy-EYE+1.5), cz)) return 1;   // chest/head
-  return 0;
+Bool PlayerHit(F64 x,F64 y,F64 z)
+{//Does the player's box, eye at x,y,z, meet a block or leave the world?
+  I64 i,j,k,x0=Floor(x-PLAYER_R+BOX_EPS),x1=Floor(x+PLAYER_R-BOX_EPS),
+	y0=Floor(y-EYE+BOX_EPS),y1=Floor(y+PLAYER_TOP-BOX_EPS),
+	z0=Floor(z-PLAYER_R+BOX_EPS),z1=Floor(z+PLAYER_R-BOX_EPS);
+  if (x0<0 || y0<0 || z0<0 || x1>=WX || y1>=WY || z1>=WZ)
+    return TRUE;
+  for (j=y0;j<=y1;j++)
+    for (k=z0;k<=z1;k++)
+      for (i=x0;i<=x1;i++)
+	if (g_world[i+WX*(k+WZ*j)])
+	  return TRUE;
+  return FALSE;
 }
 
-// one character keystroke -> game action (shared by both input back-ends)
-U0 KeyDown(I64 ch)
-{
-  if (ch=='w') g_tf=4;  else if (ch=='s') g_tb=4;
-  else if (ch=='a') g_tl=4;  else if (ch=='d') g_tr=4;
-  else if (ch=='j') g_tjl=4; else if (ch=='l') g_tjr=4;
-  else if (ch=='i') g_tpu=4; else if (ch=='k') g_tpd=4;
-  else if (ch=='r') g_tu=4;  else if (ch=='f') g_td=4;        // fly up/down (press 'g' to fly)
-  else if (ch==' ') { if (g_onground && !g_fly) { g_vy=JUMP; g_onground=0; } }   // jump
-  else if (ch=='g') { g_fly=1-g_fly; g_vy=0.0; }              // toggle creative fly
-  else if ('1'<=ch<='9') g_sel=7+ch-'0';                      // 1-9: quick-pick the first nine colour blocks (8..16)
-  else if (ch=='q') { g_sel--; if (g_sel<8)  g_sel=23; }      // cycle the selected colour (8..23); the ARROW
-  else if (ch=='e') { g_sel++; if (g_sel>23) g_sel=8;  }      //   keys do this too (see HandleInput)
-  else if (ch==0x1b) g_quit=1;                                // Esc (CH_ESC) quits
+Bool PlayerMove(I64 axis,F64 d)
+{//Moves the eye d along axis 0=x 1=y 2=z. A wall stops the box touching it.
+  F64 x=g_px,y=g_py,z=g_pz;
+  if (!axis)
+    x+=d;
+  else if (axis==1)
+    y+=d;
+  else
+    z+=d;
+  if (!PlayerHit(x,y,z)) {
+    g_px=x; g_py=y; g_pz=z;
+    return TRUE;
+  }
+  if (!axis) {
+    if (d>0)
+      g_px=Floor(g_px+PLAYER_R-BOX_EPS)+1-PLAYER_R;
+    else
+      g_px=Floor(g_px-PLAYER_R+BOX_EPS)+PLAYER_R;
+  } else if (axis==1) {
+    if (d>0)
+      g_py=Floor(g_py+PLAYER_TOP-BOX_EPS)+1-PLAYER_TOP;
+    else
+      g_py=Floor(g_py-EYE+BOX_EPS)+EYE;
+  } else if (d>0)
+    g_pz=Floor(g_pz+PLAYER_R-BOX_EPS)+1-PLAYER_R;
+  else
+    g_pz=Floor(g_pz-PLAYER_R+BOX_EPS)+PLAYER_R;
+  return FALSE;
 }
 
-U0 HandleInput()
-{
-  I64 ch;
-#ifdef TOS_NATIVE
-  // real TempleOS input (best practices from TinkerOS Demo/KeyBitMap.HC + Demo/MsgLoop.HC):
-  //  - HELD movement is POLLED from kbd.down_bitmap each frame (set g_t*=1 -> the shared block below
-  //    applies it this frame). The kernel sets/clears those bits on make/break, so a dropped KEY_UP
-  //    can't leave you "stuck walking" - and HolyCraft() clears them at startup so the launch keystrokes
-  //    ('a' in "HolyCraft.HC", etc.) don't have you strafing the moment you spawn.
-  //  - EDGE actions (jump/fly/select/quit) come from DRAINED KEY_DOWN messages - draining CONSUMES the
-  //    keys here so they don't leak to the shell/other windows behind the game.
-  I64 a1, a2, msg;
-  while (msg = ScanMsg(&a1, &a2, 1<<MSG_KEY_DOWN | 1<<MSG_KEY_UP)) {
-    if (msg==MSG_KEY_DOWN) {
-      ch = a1;
-      if      (ch==' ') { if (g_onground && !g_fly) { g_vy=JUMP; g_onground=0; } }   // jump (edge)
-      else if (ch=='g') { g_fly=1-g_fly; g_vy=0.0; }                                 // toggle creative fly
-      else if ('1'<=ch<='9') g_sel=7+ch-'0';                                         // quick-pick a colour block
-      else if (ch=='q') { g_sel--; if (g_sel<8)  g_sel=23; }                         // cycle selected block
-      else if (ch=='e') { g_sel++; if (g_sel>23) g_sel=8;  }
-      else if (ch==0x1b) { g_quit=1; return; }                                       // Esc quits
-      else if (!ch) {                                                                // arrows (char 0 + sc) cycle block
-        I64 sc = a2.u8[0];
-        if      (sc==SC_CURSOR_LEFT  || sc==SC_CURSOR_UP)   { g_sel--; if (g_sel<8)  g_sel=23; }
-        else if (sc==SC_CURSOR_RIGHT || sc==SC_CURSOR_DOWN) { g_sel++; if (g_sel>23) g_sel=8;  }
-      }
+U0 PlayerTick()
+{//One TICK of turning, walking, flying or falling.
+  F64 cy,sy,mvx=0.0,mvz=0.0;
+  if (g_tjl) g_yaw-=TURN_SPD*TICK;
+  if (g_tjr) g_yaw+=TURN_SPD*TICK;
+  if (g_tpu) g_pitch+=TURN_SPD*TICK;
+  if (g_tpd) g_pitch-=TURN_SPD*TICK;
+  g_pitch=Clamp(g_pitch,-PITCH_MAX,PITCH_MAX);
+  cy=Cos(g_yaw);
+  sy=Sin(g_yaw);
+  if (g_tf) {mvx+=sy; mvz+=cy;}
+  if (g_tb) {mvx-=sy; mvz-=cy;}
+  if (g_tl) {mvx-=cy; mvz+=sy;}
+  if (g_tr) {mvx+=cy; mvz-=sy;}
+  if (mvx) PlayerMove(0,mvx*WALK_SPD*TICK);
+  if (mvz) PlayerMove(2,mvz*WALK_SPD*TICK);
+  if (g_fly) {
+    if (g_tu) PlayerMove(1,FLY_SPD*TICK);
+    if (g_td) PlayerMove(1,-FLY_SPD*TICK);
+    g_vy=0.0;
+    g_onground=FALSE;
+  } else {
+    g_vy=Max(g_vy-GRAV*TICK,-FALL_MAX);
+    g_onground=FALSE;
+    if (!PlayerMove(1,g_vy*TICK)) {
+      if (g_vy<0) g_onground=TRUE;
+      g_vy=0.0;
     }
   }
-  // held movement: poll the kernel key-down bitmap (one frame's worth -> g_t*=1; shared block consumes it)
+}
+
+U0 KeyDown(I64 ch)
+{//A key press: jump, fly, pick a block or quit.
+  if (ch==' ') {
+    if (g_onground && !g_fly) {
+      g_vy=JUMP_V;
+      g_onground=FALSE;
+    }
+  } else if (ch=='g') {
+    g_fly=!g_fly;
+    g_vy=0.0;
+  } else if ('1'<=ch<='9')
+    g_sel=7+ch-'0';
+  else if (ch=='q') {
+    if (--g_sel<8) g_sel=23;
+  } else if (ch=='e') {
+    if (++g_sel>23) g_sel=8;
+  } else if (ch==CH_ESC)
+    g_quit=TRUE;
+}
+
+#ifdef TOS_NATIVE
+U0 InputRead()
+{//Presses from messages, held keys from the key bitmap, look from the mouse.
+  I64 arg1,arg2,msg;
+  while (msg=ScanMsg(&arg1,&arg2,1<<MSG_KEY_DOWN|1<<MSG_KEY_UP))
+    if (msg==MSG_KEY_DOWN) {
+      if (arg1)
+	KeyDown(arg1);
+      else
+	switch (arg2.u8[0]) {
+	  case SC_CURSOR_LEFT:
+	  case SC_CURSOR_UP:
+	    if (--g_sel<8) g_sel=23;
+	    break;
+	  case SC_CURSOR_RIGHT:
+	  case SC_CURSOR_DOWN:
+	    if (++g_sel>23) g_sel=8;
+	    break;
+	}
+    }
   g_tf=Bt(kbd.down_bitmap,g_scw);
   g_tb=Bt(kbd.down_bitmap,g_scs);
   g_tl=Bt(kbd.down_bitmap,g_sca);
@@ -457,67 +532,59 @@ U0 HandleInput()
   g_tpd=Bt(kbd.down_bitmap,g_sck);
   g_tu=Bt(kbd.down_bitmap,g_scr);
   g_td=Bt(kbd.down_bitmap,g_scf);
-  // Consume movement once, then recenter. A stationary mouse cannot keep turning.
-  F64 dxm=ms.pos.x-320, dym=ms.pos.y-240;
+  g_yaw+=(ms.pos.x-320)*MS_TURN;
+  g_pitch-=(ms.pos.y-240)*MS_TURN;
   MsSet(320,240);
-  g_yaw=g_yaw+dxm*0.003;
-  g_pitch=g_pitch-dym*0.003;
+}
 #else
-  while (ScanChar()) {            // peek (ScanChar does NOT consume in this runtime)...
-    ch = KeyGet();               // ...so KeyGet() consumes the char (won't block, one is ready)
-    KeyDown(ch);
-    if (g_quit) return;
-  }
-  // Movement is held state, not a countdown extended by browser key repeat.
-  g_tf=BrowserKeys[0x11]; g_tb=BrowserKeys[0x1F];
-  g_tl=BrowserKeys[0x1E]; g_tr=BrowserKeys[0x20];
-  g_tu=BrowserKeys[0x13]; g_td=BrowserKeys[0x21];
-  g_tjl=BrowserKeys[0x24]; g_tjr=BrowserKeys[0x26];
-  g_tpu=BrowserKeys[0x17]; g_tpd=BrowserKeys[0x25];
-  F64 dxm=BrowserMouseDX, dym=BrowserMouseDY;
-  BrowserMouseDX=0; BrowserMouseDY=0;
-  g_yaw+=dxm*0.003; g_pitch-=dym*0.003;
+U0 InputRead()
+{//Presses from the char queue, held keys and look from the page.
+  while (ScanChar)
+    KeyDown(KeyGet);
+  g_tf=BrowserKeys[0x11];
+  g_tb=BrowserKeys[0x1F];
+  g_tl=BrowserKeys[0x1E];
+  g_tr=BrowserKeys[0x20];
+  g_tu=BrowserKeys[0x13];
+  g_td=BrowserKeys[0x21];
+  g_tjl=BrowserKeys[0x24];
+  g_tjr=BrowserKeys[0x26];
+  g_tpu=BrowserKeys[0x17];
+  g_tpd=BrowserKeys[0x25];
+  g_yaw+=BrowserMouseDX*MS_TURN;
+  g_pitch-=BrowserMouseDY*MS_TURN;
+  BrowserMouseDX=0;
+  BrowserMouseDY=0;
+}
 #endif
 
-  // ---- everything below is shared ----
-  F64 rot=0.07;                  // snappier turn (bigger step/frame to suit the low emulator fps)
-  if (g_tjl>0){g_yaw-=rot; g_tjl--;}
-  if (g_tjr>0){g_yaw+=rot; g_tjr--;}
-  if (g_tpu>0){g_pitch+=rot; g_tpu--;}
-  if (g_tpd>0){g_pitch-=rot; g_tpd--;}
-  if (g_pitch>1.45) g_pitch=1.45;
-  if (g_pitch<-1.45) g_pitch=-1.45;
-
-  // walk in the yaw plane, per-axis collision
-  F64 spd=0.16, cy=Cos(g_yaw), sy=Sin(g_yaw), mvx=0.0, mvz=0.0;
-  if (g_tf>0){mvx+=sy; mvz+=cy; g_tf--;}
-  if (g_tb>0){mvx-=sy; mvz-=cy; g_tb--;}
-  if (g_tl>0){mvx-=cy; mvz+=sy; g_tl--;}
-  if (g_tr>0){mvx+=cy; mvz-=sy; g_tr--;}
-  if (!PlayerHits(g_px+mvx*spd, g_py, g_pz)) g_px+=mvx*spd;
-  if (!PlayerHits(g_px, g_py, g_pz+mvz*spd)) g_pz+=mvz*spd;
-
-  // vertical: creative fly, or gravity + ground/ceiling collision
-  if (g_fly) {
-    if (g_tu>0){ if (!PlayerHits(g_px,g_py+0.16,g_pz)) g_py+=0.16; g_tu--; }
-    if (g_td>0){ if (!PlayerHits(g_px,g_py-0.16,g_pz)) g_py-=0.16; g_td--; }
-    g_vy=0.0; g_onground=0;
-  } else {
-    g_vy -= GRAV; if (g_vy<-0.7) g_vy=-0.7;
-    F64 ny=g_py+g_vy;
-    if (g_vy<=0.0) {
-      if (PlayerHits(g_px,ny,g_pz)) { g_py=Floor(ny-EYE)+1.0+EYE; g_vy=0.0; g_onground=1; }
-      else { g_py=ny; g_onground=0; }
-    } else {
-      if (PlayerHits(g_px,ny,g_pz)) g_vy=0.0; else g_py=ny;
-    }
+U0 HandleInput()
+{//Reads the input, runs the physics ticks due, then breaks or places.
+  I64 i,lb,rb;
+  F64 t=tS;
+  InputRead;
+  g_pitch=Clamp(g_pitch,-PITCH_MAX,PITCH_MAX);
+  if (t-g_tick_t>0.25) g_tick_t=t-0.25;
+  while (g_tick_t+TICK<=t) {
+    g_tick_t+=TICK;
+    PlayerTick;
   }
-
-  // break / place on mouse click edges (PickTarget raycasts from the crosshair, not the cursor)
-  I64 lb=ms.lb, rb=ms.rb;
-  if (lb && !g_plb) if (PickTarget()) { g_world[WIdx(g_hx,g_hy,g_hz)]=0;    ColTop(g_hx,g_hz); }
-  if (rb && !g_prb) if (PickTarget()) { g_world[WIdx(g_bx,g_by,g_bz)]=g_sel; ColTop(g_bx,g_bz); }
-  g_plb=lb; g_prb=rb;
+  lb=ms.lb;
+  rb=ms.rb;
+  if (lb && !g_plb && PickTarget) {
+    g_world[WIdx(g_hx,g_hy,g_hz)]=0;
+    ColTop(g_hx,g_hz);
+  }
+  if (rb && !g_prb && PickTarget) {
+    i=WIdx(g_bx,g_by,g_bz);
+    g_world[i]=g_sel;
+    if (PlayerHit(g_px,g_py,g_pz))
+      g_world[i]=0;
+    else
+      ColTop(g_bx,g_bz);
+  }
+  g_plb=lb;
+  g_prb=rb;
 }
 
 #ifdef TOS_NATIVE

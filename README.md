@@ -50,8 +50,12 @@ game through four globals:
 
 ```sh
 node tools/input.test.mjs
+node tools/physics.test.mjs
 ```
 
-It compiles the browser build with HolyC-wasm and checks the input path: a still mouse leaves the camera
-still, one mouse move turns it once, a held key moves the player and letting go stops it. It finds
-HolyC-wasm in `$HOLYC_WASM` or beside this repository (`../HolyC-wasm`), and skips when it is not there.
+They compile the browser build with HolyC-wasm and run it on a clock they move. The input test checks
+that a still mouse leaves the camera still, one mouse move turns it once, a held key moves the player and
+letting go stops it. The physics test checks that the player walks as far in a second at 10 frames a
+second as at 60, that the player's box keeps the eye out of walls, ceilings and the world's edges, and
+that a block is not placed where the player stands. They find HolyC-wasm in `$HOLYC_WASM` or beside
+this repository (`../HolyC-wasm`), and skip when it is not there.
