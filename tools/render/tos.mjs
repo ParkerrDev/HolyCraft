@@ -118,7 +118,9 @@ U0 C1Test()
       DCDel(c1_dc);DCDel(c1_ref);
       c1_dc=DCNew(c1_w,c1_h);c1_ref=DCNew(c1_w,c1_h);
       c1_task->pix_width=c1_w;c1_task->pix_height=c1_h;
+      Seed(0x7A654321);
       DrawIt(c1_task,c1_dc);
+      Seed(0x7A654321);
       RenderFaces(c1_ref);
       DrawHUD(c1_ref->body,c1_w,c1_h,c1_ref->width_internal);
       c1_body=c1_dc->body;c1_expected=c1_ref->body;
@@ -153,6 +155,8 @@ C1Test;
   const calls0 = rdI(hemuVar('g_raster_calls') - gBase);
   const dcBody = rdPtr(G.c1_body);
   if (mode === 'windows') {
+    const camera=poses(world).find(p=>p.name==='spawn');
+    [camera.x,camera.y,camera.z,camera.yaw,camera.pitch].forEach((v,i)=>wrF(G.c1_pose+i*8,v));
     let request=0;
     for (const [w,h] of [[640,480],[319,199],[641,481],[52,200],[1,1],[640,16],[320,200]]) {
       wrI(G.c1_w,w);wrI(G.c1_h,h);wrI(G.c1_req,++request);
