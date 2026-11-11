@@ -81,7 +81,12 @@ node --max-old-space-size=3072 tools/render/tos.mjs windows
 The native ray comparison covers 45 poses. Three browser stress poses put the eye inside a
 solid block, which the player box prevents during play; the native exposed-face renderer does
 not support those poses. Colors identify each material and face, avoiding random dither in the
-comparison. The depth check also detects a nearer surface incorrectly hidden by a farther one.
+comparison. Matching pre-fog faces also have their integer reciprocal depths
+checked against the independent rays: endpoint truncation and GrHLine's 32.32
+interpolation allow an error from -2 to 0 depth units, plus a 0.0001-unit floating-point
+margin. This is separate from the visibility classifier's looser distance tolerance;
+it checks both displaced-nearer and displaced-farther surfaces. It does not require
+bit-identical depth buffers across different rendering algorithms.
 The native limit is 0.87 cells before fog starts because fog is selected at each block's center.
 `HLE=0` disables raster acceleration and asserts that it stayed disabled. The `windows` check
 compares DrawIt with a separately rendered view at seven sizes, including odd widths and repeated

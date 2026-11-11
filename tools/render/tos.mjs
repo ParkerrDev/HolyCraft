@@ -17,7 +17,7 @@ const { SnapshotRead, DiskRead } = await moduleAt('tools/hemu/Fixtures.mjs');
 const SRC = process.env.SRC || fileURLToPath(new URL('../../HolyCraft.HC', import.meta.url));
 const mode = process.argv[2] || 'check';
 assert(['check', 'time', 'windows'].includes(mode), 'Usage: tos.mjs [check|time|windows]');
-const RAMSZ = 402653184, W = 640, H = 480;
+const RAMSZ = 402653184, W = 640, H = 480, NEAR = 0.05, ZFAR = 2**30;
 const liveBuf = SnapshotRead(), disk = DiskRead();
 const r = compileHemu({ source: hemuFile('snapshot.HC') });
 const mod = await WebAssembly.compile(r.bytes);
@@ -72,8 +72,22 @@ const wrF = (a, v) => dv().setFloat64(gBase + a, v, true);
 const wrI = (a, v) => dv().setBigInt64(gBase + a, BigInt(v), true);
 const rdI = (a) => Number(dv().getBigInt64(gBase + a, true));
 
+function depthCheck(name, expected, pixels, depth, hard) {
+  let count=0,low=0,high=0;
+  for(let i=0;i<expected.length;i++) {
+    const hit=expected[i];
+    if(!hit||hit.t>=hard||hit.fd<NEAR||pixels[i]!==hit.code)continue;
+    const error=depth[i]-ZFAR*(1-NEAR/hit.fd);
+    // Endpoint truncation and native GrHLine's 32.32 interpolation each lose
+    // less than one depth unit. The margin covers floating-point plane setup.
+    assert(error>=-2.0001&&error<=0.0001,
+      `${name} at ${i%W},${Math.floor(i/W)}: integer depth error ${error}`);
+    low=Math.min(low,error);high=Math.max(high,error);count++;
+  }
+  return {count,low,high};
+}
+
 if (['check', 'time', 'windows'].includes(mode)) {
-  const NEAR = 0.05;
   const text = readFileSync(SRC, 'latin1'), tosPart = (text.split('#ifdef TOS_NATIVE')[1] || '').split('#else')[0];
   const def = (n, d) => Number((tosPart.match(new RegExp('#define ' + n + '\\s+([0-9.]+)')) || [0, d])[1]);
   const rdist = def('RDIST', 32), hard = def('FOG0', rdist - 8) - 0.87;   // fog goes by a cell's center, up to 0.87 behind its faces
@@ -149,7 +163,7 @@ C1Test;
     console.log('Native DrawIt: 7 sizes, growth/shrink and padded DC blits passed.');
     process.exit(0);
   }
-  const KEYS = ['sky', 'far', 'wrong', 'crack', 'over', 'deep', 'edge'], tot = { bad: 0, framesBad: 0 }, lines = [];
+  const KEYS = ['sky', 'far', 'wrong', 'crack', 'over', 'deep', 'edge'], tot = { bad: 0, framesBad: 0 }, lines = [], depths={count:0,low:0,high:0};
   for (const k of KEYS) tot[k] = 0;
   let req = 0;
   if (mode === 'time') {
@@ -177,8 +191,10 @@ C1Test;
     const got = u8().slice(gBase + dcBody, gBase + dcBody + W * H);
     const depth = rdPtr(G.g_depth);
     const zb = new Int32Array(u8().slice(gBase + depth, gBase + depth + W * H * 4).buffer), fd = new Float64Array(W * H);
-    for (let i = 0; i < W * H; i++) fd[i] = zb[i] === 0x7FFFFFFF ? Infinity : NEAR / (1 - zb[i] / 2 ** 30);
-    const res = classify(W, H, refFrame(world, p, W, H), got, hard, fd, null, (x, y, g) => seenNear(world, p, W, H, x, y, g));
+    for (let i = 0; i < W * H; i++) fd[i] = zb[i] === 0x7FFFFFFF ? Infinity : NEAR / (1 - zb[i] / ZFAR);
+    const expected=refFrame(world,p,W,H),zcheck=depthCheck(p.name,expected,got,zb,hard);
+    depths.count+=zcheck.count;depths.low=Math.min(depths.low,zcheck.low);depths.high=Math.max(depths.high,zcheck.high);
+    const res = classify(W, H, expected, got, hard, fd, null, (x, y, g) => seenNear(world, p, W, H, x, y, g));
     for (const k of KEYS) tot[k] += res[k];
     tot.bad += res.bad; if (res.bad) tot.framesBad++;
     lines.push(`${p.name.padEnd(22)} bad ${String(res.bad).padStart(6)} (sky ${res.sky}, far ${res.far}, wrong ${res.wrong}, crack ${res.crack})  over ${res.over} deep ${res.deep} edge ${res.edge}`);
@@ -190,6 +206,8 @@ C1Test;
     }
   }
   console.log(lines.join('\n'));
+  assert(depths.count>0,'No pre-fog surface depths were checked.');
+  console.log(`Integer depth: ${depths.count} matching pre-fog pixels, error ${depths.low} to ${depths.high} units.`);
   console.log(`TOTAL bad ${tot.bad} (sky ${tot.sky}, far ${tot.far}, wrong ${tot.wrong}, crack ${tot.crack}) in ${tot.framesBad} of ${lines.length} frames; over ${tot.over}, deep ${tot.deep}, edge ${tot.edge}; span fast-path calls ${rdI(hemuVar('g_raster_calls') - gBase) - calls0}; BADOPs ${badops.length}`);
   if (process.env.HLE === '0') assert.equal(rdI(hemuVar('g_raster_calls') - gBase) - calls0, 0, 'Raster fast paths ran during native reference check.');
   assert.equal(badops.length, 0, 'HEMU encountered unsupported instructions.');
