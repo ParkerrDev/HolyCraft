@@ -104,7 +104,9 @@ REPEATS=3 node tools/render/qemu.mjs time /path/to/prior/HolyCraft.HC
 The QEMU check compares 1,320,325 pre-fog pixels against independent ray results. It uses
 a deterministic scene and reports the QEMU backend plus the path to its execution evidence.
 The timing command warms each renderer, then measures 200 spawn-view frames using guest
-`tS`; `N` changes the frame count. The baseline source must provide the native rendering API.
+`tS`; `N` changes the frame count. Both renderers use the same explicit camera above
+the middle terrain column. The baseline must provide the native rendering API;
+the sky-row initializer is called only when that version defines it.
 
 `node tools/lifetime.test.mjs` checks seven startup and resize allocation failures in
 original TempleOS. `BACKEND=hemu` runs the same source through `TEMPLEOS_WEB`;

@@ -26,8 +26,14 @@ U0 C1Time()
   I64 i;
   F64 t0,elapsed;
   CDC *dc;
+  Seed(0x7A654321);
   Init;
+#ifdef SkyRowsMake
   SkyRowsMake;
+#endif
+  g_px=64.5;g_pz=64.5;
+  g_py=g_hm[64+128*64]+2.62;
+  g_yaw=0.7;g_pitch=-0.06;
   dc=DCNew(640,480);
   for (i=0;i<10;i++) RenderFaces(dc);
   t0=tS;

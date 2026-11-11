@@ -72,7 +72,7 @@ try {
       page.on('pageerror',error=>errors.push(error.message));
       await page.goto(`http://127.0.0.1:${server.address().port}/?${cores===1?'single':'smp'}`);
       await MachineReady(page,cores);
-      await page.waitForFunction(()=>window.machine.events.some(m=>m.name==='Welcome'&&m.state==='done'),null,{timeout:45000});
+      await page.waitForFunction(()=>window.machine.events.some(m=>m.cmd==='guestPatch'&&m.state==='installed'),null,{timeout:45000});
       await Check(page,nativeProbe);
       const id='craft-window-'+cores;
       await MachinePost(page,{cmd:'osLaunch',id,name:'HolyCraft native window',src:program});
