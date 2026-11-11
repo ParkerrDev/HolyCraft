@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {loadGame,SC,WY,EYE,PLAYER_R,PLAYER_TOP} from './game.mjs';
 
 const g=await loadGame();
-if(!g){console.log('HolyCraft physics: skipped, HolyC-wasm not found (set HOLYC_WASM to its folder)');process.exit(0);}
+assert(g,'Set HOLYC_WASM to a HolyC-wasm checkout.');
 // Flat ground with its top at y=14, a wall along z=70 and a ceiling block layer at y=16.
 for(let x=44;x<=84;x++)for(let z=44;z<=84;z++)for(let y=0;y<WY;y++)g.setBlock(x,y,z,y<14?3:0);
 for(let x=56;x<=72;x++)for(let y=14;y<=18;y++)g.setBlock(x,y,70,3);

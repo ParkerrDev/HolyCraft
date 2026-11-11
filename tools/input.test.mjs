@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import {loadGame,SC} from './game.mjs';
 
 const g=await loadGame();
-if(!g){console.log('HolyCraft input: skipped, HolyC-wasm not found (set HOLYC_WASM to its folder)');process.exit(0);}
+assert(g,'Set HOLYC_WASM to a HolyC-wasm checkout.');
 const state=()=>['g_pitch','g_yaw','g_px','g_pz'].map(g.f64);
 g.play(500);
 const initial=state();

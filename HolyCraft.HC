@@ -5,23 +5,27 @@
 //
 //Two builds. In the browser (HolyC-wasm) a ray a pixel draws the frame,
 //blitted with GrSprite. In TempleOS (Run.HC defines TOS_NATIVE) DrawIt
-//fills the exposed faces with GrFillPoly3 over a depth buffer.
+//fills exposed faces with subpixel spans over a depth buffer.
 #ifdef TOS_NATIVE
 #define RDIST		32.0	//Render distance, cells.
 #define FOG0		20.0	//Fog starts here and is all sky at RDIST.
+#define NEAR		0.05	//The box keeps the eye 0.2 from a block.
+#define ZFAR		1073741824.0 //Depth far away, 1<<30.
+#define SKY_LVS		32	//Dither steps between two sky colors.
+#define SKY_ROW		1088	//A sky row: 1024 pixels and 64 of random start.
 #else
 #define RES_W		640
 #define RES_H		480
 #define SCALE		1
 #define RDIST		48.0
 #define FOG0		32.0
-#define SKY_K		2.0	//Sky ramp steps a unit of elevation sine.
 #endif
 #define FOV		1.05	//Half the view's height at distance 1.
-#define WX      128           // world size
-#define WZ      128
-#define WY      40
-#define WATER   5
+#define SKY_K		2.0	//Sky ramp steps a unit of elevation sine.
+#define WX	128
+#define WZ	128
+#define WY	40
+#define WATER	5
 #define EYE		1.62	//Eye above the feet.
 #define PLAYER_R	0.3	//Half the width of the player's box.
 #define PLAYER_TOP	0.2	//Top of the box above the eye.
@@ -36,173 +40,199 @@
 #define JUMP_V		13.4	//Clears one block.
 #define FALL_MAX	21.0
 
-U8  *g_world = NULL;         // WX*WZ*WY voxels, 0 = air
-U8  *g_fb    = NULL;         //The browser's frame, RES_W*RES_H.
-U8   g_skyr[3];             // sky gradient ramp (blue zenith -> ltblue -> ltcyan horizon)
-U8   g_lr[24*4];            // per-block ramp, 4 levels dark->bright. 0=air; 1-7 materials; 8-23 = the 16 system colors
-U8   g_flo[24*6], g_fhi[24*6]; // per (block,face): the 2 ramp colors bracketing that face's light shade
-I64  g_fthr[24*6];          // per (block,face): probability 0..65536 for the LIVE "static" dither blend
-U8  *g_hm    = NULL;         // per (x,z): top solid y (heightmap) -> bounds the native exposed-face scan
-I64  g_frame = 0;           // frame counter -> reseeds the dither each frame so it animates (like Varoom)
-F64  g_px, g_py, g_pz;       // camera position
-F64  g_yaw, g_pitch;         // camera angles
-I64  g_sel  = 8;             // selected block to place (8..23 = the 16 palette-colour blocks)
-I64  g_plb  = 0, g_prb = 0;  // previous mouse button states (edge detect)
-// Optional browser input bridge. Native TempleOS uses its keyboard and MsSet;
-// holyc-wasm fills these globals from the focused canvas's shared input state.
-I64 BrowserMouseCapture=0, BrowserMouseDX=0, BrowserMouseDY=0;
+U8 *g_world=NULL,*g_fb=NULL,*g_hm=NULL,*g_lo=NULL;
+U8 g_skyr[3],g_lr[24*4],g_flo[24*6],g_fhi[24*6];
+I64 g_fthr[24*6]; //Probability of the brighter face color, 0 to 65535.
+I64 g_frame=0,g_sel=8,g_plb=0,g_prb=0;
+F64 g_px,g_py,g_pz,g_yaw,g_pitch;
+//The page supplies held keys and relative mouse motion to the browser build.
+I64 BrowserMouseCapture=0,BrowserMouseDX=0,BrowserMouseDY=0;
 U8 BrowserKeys[128];
-I64 g_tf,g_tb,g_tl,g_tr,g_tu,g_td,g_tjl,g_tjr,g_tpu,g_tpd; //Keys held.
-F64 g_vy=0.0,g_tick_t; //Up speed, and the time of the last physics tick.
+I64 g_tf,g_tb,g_tl,g_tr,g_tu,g_td,g_tjl,g_tjr,g_tpu,g_tpd;
+F64 g_vy=0.0,g_tick_t;
 I64 g_fly=0,g_onground=0,g_quit=0;
+I64 g_ylo,g_yhi; //Bounds of blocks with exposed faces.
 #ifdef TOS_NATIVE
-// native face-rasterizer state (declared before Init, which allocates g_depth). CDC is an OS type, so
-// these stay inside TOS_NATIVE (the browser/holyc-wasm target never sees them).
-I32 *g_depth = NULL;          // z-buffer (I32/px; smaller==nearer; cleared to I32_MAX); attached to the DC each frame
-I64  g_depthcap = 1024*768;   // z-buffer capacity in px (covers any sane screen)
-F64  g_focal, g_cxc, g_cyc;   // perspective focal length (px) + screen centre (set per frame from the DC size)
-I64  g_sw, g_sh;              // screen width/height (px) -- for the off-screen face reject in DrawFace
-CDC *g_rdc = NULL;            // the DC the current frame's faces fill (set at the top of RenderFaces)
-// scancodes of the held-movement keys, precomputed once (Char2ScanCode is slow). On real TempleOS we
-// POLL kbd.down_bitmap each frame for these (robust held-key state, like Demo/Games/RainDrops.HC) instead
-// of tracking make/break messages - a lost KEY_UP can't leave you "stuck walking" that way.
+I32 *g_depth=NULL; //A pixel's depth, ZFAR-g_zk/forward: linear on the screen.
+I64 g_depthcap=0,g_sw,g_sh,g_edgecap=0,*g_left=NULL,*g_right=NULL;
+F64 g_focal,g_cxc,g_cyc,g_zk;
+CDC *g_rdc=NULL,*g_view=NULL;
+U8 *g_skyrows=NULL; //Dithered rows between two sky colors, SKY_LVS+1 a pair.
+U8 *g_win; //The view's top left pixel in the DC's body, g_sw by g_sh.
+//Held keys are polled from kbd.down_bitmap, so a lost key up can't leave
+//the player walking. Their scan codes are looked up once: Char2ScanCode is
+//slow.
 I64 g_scw,g_scs,g_sca,g_scd,g_scr,g_scf,g_scj,g_scl,g_sci,g_sck;
 #endif
 
-I64 WIdx(I64 x, I64 y, I64 z)
+I64 WIdx(I64 x,I64 y,I64 z)
 {
-  return x + WX*(z + WZ*y);
+  return x+WX*(z+WZ*y);
 }
 
-I64 Solid(I64 x, I64 y, I64 z)
+I64 Solid(I64 x,I64 y,I64 z)
 {
   if (x<0 || x>=WX || z<0 || z>=WZ || y<0 || y>=WY) return 0;
   return g_world[WIdx(x,y,z)];
 }
 
-I64 HeightAt(I64 x, I64 z)
+I64 HeightAt(I64 x,I64 z)
 {
-  F64 h = 14.0 + 4.0*Sin(x*0.16) + 4.0*Cos(z*0.15) + 2.5*Sin((x+z)*0.08) + 2.0*Cos((x-z)*0.11);
-  I64 hi = h;
+  F64 h=14.0+4.0*Sin(x*0.16)+4.0*Cos(z*0.15)+
+	2.5*Sin((x+z)*0.08)+2.0*Cos((x-z)*0.11);
+  I64 hi=h;
   if (hi<2) hi=2;
   if (hi>WY-8) hi=WY-8;
   return hi;
 }
 
+U8 g_materials[8*4]={
+  0,0,0,0,
+  0,2,10,10, //Grass.
+  0,6,6,14, //Dirt.
+  0,8,7,15, //Stone.
+  0,6,6,14, //Wood.
+  0,2,10,10, //Leaves.
+  6,14,14,15, //Sand.
+  1,9,11,11}; //Water.
+U8 g_darker[16]={0,0,0,1,0,0,0,8,0,1,2,9,4,5,6,7},
+	g_lighter[16]={8,9,10,11,12,13,14,15,7,11,15,15,14,15,15,15};
+
 U0 SetRamp()
-{
-  I64 c; U8 dk[16], lt[16];
-  g_skyr[0]=1; g_skyr[1]=9; g_skyr[2]=11;                 // sky: blue -> ltblue -> ltcyan
-  // Materials (terrain). 4-level ramp dark->bright; face lighting + the live dither blend the two
-  // bracketing colors. Darken with BLACK (not gray) so shading stays the material's hue.
-  g_lr[1*4+0]=0;  g_lr[1*4+1]=2;  g_lr[1*4+2]=10; g_lr[1*4+3]=10;   // grass  black->green->ltgreen
-  g_lr[2*4+0]=0;  g_lr[2*4+1]=6;  g_lr[2*4+2]=6;  g_lr[2*4+3]=14;   // dirt   black->brown->yellow
-  g_lr[3*4+0]=0;  g_lr[3*4+1]=8;  g_lr[3*4+2]=7;  g_lr[3*4+3]=15;   // stone  black->dkgray->ltgray->white
-  g_lr[4*4+0]=0;  g_lr[4*4+1]=6;  g_lr[4*4+2]=6;  g_lr[4*4+3]=14;   // wood
-  g_lr[5*4+0]=0;  g_lr[5*4+1]=2;  g_lr[5*4+2]=10; g_lr[5*4+3]=10;   // leaves
-  g_lr[6*4+0]=6;  g_lr[6*4+1]=14; g_lr[6*4+2]=14; g_lr[6*4+3]=15;   // sand   brown->yellow->white
-  g_lr[7*4+0]=1;  g_lr[7*4+1]=9;  g_lr[7*4+2]=11; g_lr[7*4+3]=11;   // water  blue->ltblue->ltcyan
-  // The 16 system colours are blocks 8..23 (block 8+c = palette colour c) -> the placeable hotbar. These are
-  // the 16 DISTINCT colours; the 7 terrain materials (1..7) each duplicate one of these hues (grass/leaves=
-  // green, dirt/wood=brown, stone=gray, sand=yellow, water=cyan) so they're kept for terrain/trees but NOT
-  // shown in the hotbar (no duplicate swatches).
-  dk[0] =0; dk[1] =0; dk[2] =0;  dk[3] =1;  dk[4] =0;  dk[5] =0;  dk[6] =0;  dk[7] =8;   // darker shade per color
-  dk[8] =0; dk[9] =1; dk[10]=2;  dk[11]=9;  dk[12]=4;  dk[13]=5;  dk[14]=6;  dk[15]=7;
-  lt[0] =8; lt[1] =9; lt[2] =10; lt[3] =11; lt[4] =12; lt[5] =13; lt[6] =14; lt[7] =15;  // brighter shade per color
-  lt[8] =7; lt[9] =11;lt[10]=15; lt[11]=15; lt[12]=14; lt[13]=15; lt[14]=15; lt[15]=15;
-  for (c=0; c<16; c++) {
-    g_lr[(8+c)*4+0]=dk[c]; g_lr[(8+c)*4+1]=c; g_lr[(8+c)*4+2]=c; g_lr[(8+c)*4+3]=lt[c];
+{//Terrain ramps, then the 16 distinct palette colors in the hotbar.
+  I64 c;
+  g_skyr[0]=BLUE; g_skyr[1]=LTBLUE; g_skyr[2]=LTCYAN;
+  MemCpy(g_lr,g_materials,sizeof(g_materials));
+  for (c=0;c<16;c++) {
+    g_lr[(8+c)*4]=g_darker[c];
+    g_lr[(8+c)*4+1]=c;
+    g_lr[(8+c)*4+2]=c;
+    g_lr[(8+c)*4+3]=g_lighter[c];
   }
 }
 
 U0 BuildFaceShades()
-{   // Directional per-face lighting: dot each of the 6 cube-face normals with a fixed light direction to
-    // get 6 brightness levels, and resolve each to (two ramp colors + dither threshold). Done ONCE -> the
-    // hot loop is a single table lookup per pixel. Face order: 0=-X 1=+X 2=-Y 3=+Y 4=-Z 5=+Z.
-  F64 Lx=0.394, Ly=0.788, Lz=0.473, amb=0.30;   // light dir (above + +x/+z), pre-normalized
-  I64 f, bt;
-  for (f=0; f<6; f++) {
-    F64 d;
-    if      (f==0) d=-Lx; else if (f==1) d=Lx;
-    else if (f==2) d=-Ly; else if (f==3) d=Ly;
-    else if (f==4) d=-Lz; else          d=Lz;
-    if (d<0.0) d=0.0;
-    F64 p=(amb+(1.0-amb)*d)*3.0;          // brightness 0..1 -> ramp position 0..3
-    I64 lo=p; if (lo>2) lo=2;
-    F64 fr=p-lo; if (fr<0.0) fr=0.0; if (fr>1.0) fr=1.0;
-    for (bt=1; bt<=23; bt++) {              // 7 materials (terrain) + the 16 palette-colour blocks (8..23)
-      g_flo[bt*6+f] =g_lr[bt*4+lo];
-      g_fhi[bt*6+f] =g_lr[bt*4+lo+1];
-      g_fthr[bt*6+f]=fr*65536.0;            // probability the pixel takes the brighter color (live dither)
-      if (g_fthr[bt*6+f]>65535) g_fthr[bt*6+f]=65535;   // clamp for the U16 dither_probability field
+{//Fixed light on faces -X,+X,-Y,+Y,-Z,+Z; dither between ramp colors.
+  I64 f,bt,lo;
+  F64 lx=0.394,ly=0.788,lz=0.473,amb=0.30,d,p,fr;
+  for (f=0;f<6;f++) {
+    switch (f) {
+      case 0: d=-lx; break;
+      case 1: d=lx; break;
+      case 2: d=-ly; break;
+      case 3: d=ly; break;
+      case 4: d=-lz; break;
+      case 5: d=lz; break;
+    }
+    p=(amb+(1.0-amb)*Max(d,0.0))*3.0;
+    lo=MinI64(p,2);
+    fr=Clamp(p-lo,0.0,1.0);
+    for (bt=1;bt<=23;bt++) {
+      g_flo[bt*6+f]=g_lr[bt*4+lo];
+      g_fhi[bt*6+f]=g_lr[bt*4+lo+1];
+      g_fthr[bt*6+f]=MinI64(fr*65536.0,65535);
     }
   }
 }
 
-U0 PlantTree(I64 x, I64 top, I64 z)
+U0 PlantTree(I64 x,I64 top,I64 z)
 {
   I64 dy,lx,ly,lz;
   for (dy=0; dy<4; dy++)
-    if (top+dy<WY) g_world[WIdx(x,top+dy,z)]=4;            // trunk
+    if (top+dy<WY) g_world[WIdx(x,top+dy,z)]=4;
   for (ly=top+3; ly<=top+5; ly++)
     for (lx=x-2; lx<=x+2; lx++)
-      for (lz=z-2; lz<=z+2; lz++)              // (no `continue` - TempleOS HolyC has no such keyword)
-        if (!Solid(lx,ly,lz))
-          if ((lx-x)*(lx-x)+(lz-z)*(lz-z)+(ly-top-4)*(ly-top-4) <= 6)
-            if (lx>=0 && lx<WX && lz>=0 && lz<WZ && ly<WY) g_world[WIdx(lx,ly,lz)]=5;
+      for (lz=z-2; lz<=z+2; lz++)
+	if (!Solid(lx,ly,lz))
+	  if ((lx-x)*(lx-x)+(lz-z)*(lz-z)+(ly-top-4)*(ly-top-4)<=6)
+	    if (lx>=0 && lx<WX && lz>=0 && lz<WZ && ly<WY)
+	      g_world[WIdx(lx,ly,lz)]=5;
 }
 
 U0 GenWorld()
 {
-  I64 x,z,y,h;
+  I64 x,z,y,h,b;
   for (x=0; x<WX; x++)
     for (z=0; z<WZ; z++) {
-      h = HeightAt(x,z);
+      h=HeightAt(x,z);
       for (y=0; y<WY; y++) {
-        I64 b=0;
-        if (y<h-3)      b=3;        // stone
-        else if (y<h-1) b=2;        // dirt
-        else if (y<h)   b=1;        // grass (top)
-        if (b==0 && y<=WATER && y>=h) b=7;   // water above low terrain
-        if (b==1 && h<=WATER+1) b=6;          // sand at the shoreline
-        g_world[WIdx(x,y,z)]=b;
+	b=0;
+	if (y<h-3)	b=3;	    //stone
+	else if (y<h-1) b=2;	    //dirt
+	else if (y<h)	b=1;	    //grass (top)
+	if (b==0 && y<=WATER && y>=h) b=7;   //water above low terrain
+	if (b==1 && h<=WATER+1) b=6;	      //sand at the shoreline
+	g_world[WIdx(x,y,z)]=b;
       }
-      if (h>WATER+1 && ((x*7+z*13)%53)==0) PlantTree(x,h,z);
+      if (h>WATER+1 && (x*7+z*13)%53==0) PlantTree(x,h,z);
     }
 }
 
-// heightmap = the top solid voxel of each (x,z) column. The native face-rasterizer walks this "shell"
-// (top face + the side faces exposed wherever a neighbour column is lower) instead of every voxel.
-U0 ColTop(I64 x, I64 z)
-{
-  I64 y, top=0;
-  for (y=WY-1; y>=0; y--)
-    if (g_world[WIdx(x,y,z)]) { top=y; break; }
-  g_hm[x+WX*z]=top;
+Bool CellOpen(U8 *w,I64 x,I64 y,I64 z)
+{//Is the block at w, cell x,y,z, there with a face on air in the world?
+  if (!*w) return FALSE;
+  if (y==WY-1 || !w[WX*WZ]) return TRUE;
+  if (y && !w[-WX*WZ]) return TRUE;
+  if (x && !w[-1]) return TRUE;
+  if (x<WX-1 && !w[1]) return TRUE;
+  if (z && !w[-WX]) return TRUE;
+  if (z<WZ-1 && !w[WX]) return TRUE;
+  return FALSE;
+}
+
+U0 ColTop(I64 x,I64 z)
+{//A column's top block, and its lowest block with a face on air.
+  I64 top=WY-1,lo=0,c=x+WX*z;
+  while (top>=0 && !g_world[c+WX*WZ*top])
+    top--;
+  if (top<0) {
+    g_hm[c]=0;
+    g_lo[c]=1;
+  } else {
+    while (lo<top && !CellOpen(g_world+c+WX*WZ*lo,x,lo,z))
+      lo++;
+    g_hm[c]=top;
+    g_lo[c]=lo;
+    if (lo<g_ylo) g_ylo=lo;
+    if (top>=g_yhi) g_yhi=top+1;
+  }
+}
+
+U0 ColsTop(I64 x,I64 z)
+{//After a block changes in column x,z: it and the four beside it.
+  ColTop(x,z);
+  if (x) ColTop(x-1,z);
+  if (x<WX-1) ColTop(x+1,z);
+  if (z) ColTop(x,z-1);
+  if (z<WZ-1) ColTop(x,z+1);
 }
 
 U0 BuildHM()
 {
   I64 x,z;
-  for (x=0; x<WX; x++)
-    for (z=0; z<WZ; z++) ColTop(x,z);
+  g_ylo=WY;
+  g_yhi=0;
+  for (x=0;x<WX;x++)
+    for (z=0;z<WZ;z++)
+      ColTop(x,z);
 }
 
 U0 Init()
 {
+  g_quit=FALSE; g_plb=0; g_prb=0; g_frame=0; g_sel=8;
+  BrowserMouseDX=0; BrowserMouseDY=0;
   g_tf=0; g_tb=0; g_tl=0; g_tr=0; g_tu=0; g_td=0;
   g_tjl=0; g_tjr=0; g_tpu=0; g_tpd=0;
-  g_world = MAlloc(WX*WZ*WY);
-  g_hm    = MAlloc(WX*WZ);
-#ifdef TOS_NATIVE
-  g_depth=MAlloc(g_depthcap*sizeof(I32));
-#else
+  g_world=MAlloc(WX*WZ*WY);
+  g_hm=MAlloc(WX*WZ);
+  g_lo=MAlloc(WX*WZ);
+#ifndef TOS_NATIVE
   g_fb=MAlloc(RES_W*RES_H);
 #endif
-  SetRamp();
-  BuildFaceShades();
-  GenWorld();
-  BuildHM();
+  SetRamp;
+  BuildFaceShades;
+  GenWorld;
+  BuildHM;
   g_px=WX/2+0.5;
   g_pz=WZ/2+0.5;
   g_py=g_hm[WX/2+WX*(WZ/2)]+1+EYE;
@@ -227,30 +257,51 @@ U0 SetupCam()
   g_bix=Floor(g_cox); g_biy=Floor(g_coy); g_biz=Floor(g_coz);
 }
 
-// raycast from the camera center to the first solid voxel; returns hit + the
-// empty cell just before it (for placing). out_* via globals.
-I64 g_hx,g_hy,g_hz, g_bx,g_by,g_bz;   // hit cell, and the air cell before it
+I64 g_hx,g_hy,g_hz,g_bx,g_by,g_bz;
+
 I64 PickTarget()
-{
-  F64 cp=Cos(g_pitch), sp=Sin(g_pitch), cy=Cos(g_yaw), sy=Sin(g_yaw);
-  F64 dx=sy*cp, dy=sp, dz=cy*cp;
-  F64 ox=g_px, oy=g_py, oz=g_pz;
-  I64 ix=Floor(ox), iy=Floor(oy), iz=Floor(oz), px=ix,py=iy,pz=iz;
-  F64 adx=Abs(dx),ady=Abs(dy),adz=Abs(dz);
-  I64 stx,sty,stz; F64 tdx,tdy,tdz,tmx,tmy,tmz;
-  if (dx>0.0){stx=1;tdx=1.0/adx;tmx=(ix+1-ox)*tdx;}else if(dx<0.0){stx=-1;tdx=1.0/adx;tmx=(ox-ix)*tdx;}else{stx=0;tdx=1000000.0;tmx=1000000.0;}
-  if (dy>0.0){sty=1;tdy=1.0/ady;tmy=(iy+1-oy)*tdy;}else if(dy<0.0){sty=-1;tdy=1.0/ady;tmy=(oy-iy)*tdy;}else{sty=0;tdy=1000000.0;tmy=1000000.0;}
-  if (dz>0.0){stz=1;tdz=1.0/adz;tmz=(iz+1-oz)*tdz;}else if(dz<0.0){stz=-1;tdz=1.0/adz;tmz=(oz-iz)*tdz;}else{stz=0;tdz=1000000.0;tmz=1000000.0;}
-  I64 step; F64 t=0.0;
-  for (step=0; step<48; step++) {
-    px=ix; py=iy; pz=iz;
-    if (tmx<tmy && tmx<tmz){ix+=stx;t=tmx;tmx+=tdx;}
-    else if (tmy<tmz)      {iy+=sty;t=tmy;tmy+=tdy;}
-    else                   {iz+=stz;t=tmz;tmz+=tdz;}
-    if (t>6.0) return 0;
-    if (Solid(ix,iy,iz)) { g_hx=ix;g_hy=iy;g_hz=iz; g_bx=px;g_by=py;g_bz=pz; return 1; }
+{//The first block within six cells, and the empty cell before it.
+  F64 cp=Cos(g_pitch),sp=Sin(g_pitch),cy=Cos(g_yaw),sy=Sin(g_yaw),
+	dx=sy*cp,dy=sp,dz=cy*cp,ox=g_px,oy=g_py,oz=g_pz,
+	tdx,tdy,tdz,tmx,tmy,tmz,t=0.0;
+  I64 ix=Floor(ox),iy=Floor(oy),iz=Floor(oz),px,py,pz,stx,sty,stz;
+  if (dx>0.0) {
+    stx=1; tdx=1.0/dx; tmx=(ix+1-ox)*tdx;
+  } else if (dx<0.0) {
+    stx=-1; tdx=-1.0/dx; tmx=(ox-ix)*tdx;
+  } else {
+    stx=0; tdx=1000000.0; tmx=1000000.0;
   }
-  return 0;
+  if (dy>0.0) {
+    sty=1; tdy=1.0/dy; tmy=(iy+1-oy)*tdy;
+  } else if (dy<0.0) {
+    sty=-1; tdy=-1.0/dy; tmy=(oy-iy)*tdy;
+  } else {
+    sty=0; tdy=1000000.0; tmy=1000000.0;
+  }
+  if (dz>0.0) {
+    stz=1; tdz=1.0/dz; tmz=(iz+1-oz)*tdz;
+  } else if (dz<0.0) {
+    stz=-1; tdz=-1.0/dz; tmz=(oz-iz)*tdz;
+  } else {
+    stz=0; tdz=1000000.0; tmz=1000000.0;
+  }
+  while (TRUE) {
+    px=ix; py=iy; pz=iz;
+    if (tmx<tmy && tmx<tmz) {
+      ix+=stx; t=tmx; tmx+=tdx;
+    } else if (tmy<tmz) {
+      iy+=sty; t=tmy; tmy+=tdy;
+    } else {
+      iz+=stz; t=tmz; tmz+=tdz;
+    }
+    if (t>6.0) return FALSE;
+    if (Solid(ix,iy,iz)) {
+      g_hx=ix; g_hy=iy; g_hz=iz;
+      g_bx=px; g_by=py; g_bz=pz;
+      return TRUE;
+    }
+  }
 }
 
 Bool PlayerHit(F64 x,F64 y,F64 z)
@@ -345,7 +396,7 @@ U0 KeyDown(I64 ch)
     if (--g_sel<8) g_sel=23;
   } else if (ch=='e') {
     if (++g_sel>23) g_sel=8;
-  } else if (ch==CH_ESC)
+  } else if (ch==CH_ESC || ch==CH_SHIFT_ESC)
     g_quit=TRUE;
 }
 
@@ -420,7 +471,7 @@ U0 HandleInput()
   rb=ms.rb;
   if (lb && !g_plb && PickTarget) {
     g_world[WIdx(g_hx,g_hy,g_hz)]=0;
-    ColTop(g_hx,g_hz);
+    ColsTop(g_hx,g_hz);
   }
   if (rb && !g_prb && PickTarget) {
     i=WIdx(g_bx,g_by,g_bz);
@@ -428,156 +479,419 @@ U0 HandleInput()
     if (PlayerHit(g_px,g_py,g_pz))
       g_world[i]=0;
     else
-      ColTop(g_bx,g_bz);
+      ColsTop(g_bx,g_bz);
   }
   g_plb=lb;
   g_prb=rb;
 }
 
-#ifdef TOS_NATIVE
-// ===== native FACE-RASTERIZER ====================================================================
-// Instead of one DDA ray per pixel (~302K rays/frame -> ~0.4fps in the x86 emulator), draw the world's
-// exposed block FACES as filled z-buffered 3D quads via the OS primitive GrFillPoly3(). Its inner span
-// filler GrFillRow is HLE-accelerated by HEMU (the SAME native-speed path that lets Varoom hit 30fps),
-// and it z-buffers through dc->depth_buf so faces occlude correctly + each pixel is written ~once.
-// We do the perspective projection ourselves (matching RenderRows' fov=1.05 / camera basis). Every
-// "var - var" below is deliberate: real TempleOS HolyC mis-compiles "literal - <mul/div expr>".
-I64 ProjPt(F64 wxf, F64 wyf, F64 wzf, CD3I32 *p)
-{//world -> screen (x,y px) + depth z (>0, nearer==smaller). Returns 0 if behind the near plane.
-  F64 rx, ry, rz, fd, rt, upc, inv, dxv, dyv, dzv;
-  I64 tx, ty, tz;
-  rx = wxf - g_px; ry = wyf - g_py; rz = wzf - g_pz;
-  fd = rx*g_fwx + ry*g_fwy + rz*g_fwz;          // forward = camera-space depth
-  if (fd < 0.2) return 0;
-  rt  = rx*g_rgx + rz*g_rgz;                     // right (rgy is always 0)
-  upc = rx*g_upx + ry*g_upy + rz*g_upz;          // up
-  inv = g_focal / fd;
-  dxv = rt*inv;  dyv = upc*inv;
-  tx = g_cxc + dxv;  p->x = tx;                  // + is commutative -> codegen-safe
-  ty = g_cyc - dyv;  p->y = ty;                  // var - var (NOT literal - expr)
-  dzv = fd * 256.0;  tz = dzv;  p->z = tz;
-  return 1;
-}
-
-U0 DrawFace(I64 cx, I64 cy0, I64 cy1, I64 cz, I64 faceid, I64 bt)
-{//one face spanning cells cy0..cy1 vertically (cy0==cy1 = single cell). face 0=-X 1=+X 2=-Y 3=+Y 4=-Z 5=+Z.
-  CD3I32 poly[4];
-  F64 ax, ay, az, bx, by, bz;
-  I64 ok=0;
-  ax=cx; ay=cy0; az=cz; bx=cx+1; by=cy1+1; bz=cz+1;
-  if      (faceid==3) { ok+=ProjPt(ax,by,az,&poly[0]); ok+=ProjPt(bx,by,az,&poly[1]); ok+=ProjPt(bx,by,bz,&poly[2]); ok+=ProjPt(ax,by,bz,&poly[3]); }
-  else if (faceid==2) { ok+=ProjPt(ax,ay,az,&poly[0]); ok+=ProjPt(ax,ay,bz,&poly[1]); ok+=ProjPt(bx,ay,bz,&poly[2]); ok+=ProjPt(bx,ay,az,&poly[3]); }
-  else if (faceid==0) { ok+=ProjPt(ax,ay,az,&poly[0]); ok+=ProjPt(ax,by,az,&poly[1]); ok+=ProjPt(ax,by,bz,&poly[2]); ok+=ProjPt(ax,ay,bz,&poly[3]); }
-  else if (faceid==1) { ok+=ProjPt(bx,ay,az,&poly[0]); ok+=ProjPt(bx,ay,bz,&poly[1]); ok+=ProjPt(bx,by,bz,&poly[2]); ok+=ProjPt(bx,by,az,&poly[3]); }
-  else if (faceid==4) { ok+=ProjPt(ax,ay,az,&poly[0]); ok+=ProjPt(bx,ay,az,&poly[1]); ok+=ProjPt(bx,by,az,&poly[2]); ok+=ProjPt(ax,by,az,&poly[3]); }
-  else                { ok+=ProjPt(ax,ay,bz,&poly[0]); ok+=ProjPt(ax,by,bz,&poly[1]); ok+=ProjPt(bx,by,bz,&poly[2]); ok+=ProjPt(bx,ay,bz,&poly[3]); }
-  if (ok==4) {
-    // cheap reject: skip the (emulated, costly) GrFillPoly3 when the whole quad is off one screen edge
-    if (poly[0].x<0    && poly[1].x<0    && poly[2].x<0    && poly[3].x<0)    return;
-    if (poly[0].x>=g_sw && poly[1].x>=g_sw && poly[2].x>=g_sw && poly[3].x>=g_sw) return;
-    if (poly[0].y<0    && poly[1].y<0    && poly[2].y<0    && poly[3].y<0)    return;
-    if (poly[0].y>=g_sh && poly[1].y>=g_sh && poly[2].y>=g_sh && poly[3].y>=g_sh) return;
-    // LIVE probability dither between the two ramp colours bracketing this face's light shade -- the OS's
-    // GrFillRow (HLE-accelerated) rolls RandU16<prob per pixel, EXACTLY like the browser raycaster's dither,
-    // so the native build gets the same >16-colour blended look. (canonical idiom: dither + c2<<16 + c1.)
-    I64 k = bt*6+faceid;
-    g_rdc->color = ROPF_PROBABILITY_DITHER + g_fhi[k] << 16 + g_flo[k];
-    g_rdc->dither_probability_u16 = g_fthr[k];
-    GrFillPoly3(g_rdc, 4, poly);
+U0 DrawHUD(U8 *b,I64 w,I64 h,I64 wi)
+{//The cross to aim with and the bar of blocks to place, over the view.
+  I64 i,t,blk,px,py,qx,c,cx=w/2-1,cy=h/2-1,
+	aw=MaxI64(w/110,4),bw=w/17,gap=MaxI64(bw/8,1),bh=bw*3/4,
+	x0=(w-16*bw)/2,y0=h-bh-MaxI64(bh/3,1);
+  if (bw<3 || y0<=0 || cy+aw*3>=h) return;
+  for (t=0;t<2;t++) {
+    for (i=-aw;i<=aw*3;i++)
+      b[(cy+i)*wi+cx+t]=WHITE;
+    for (i=-aw;i<=aw;i++)
+      b[(cy+t)*wi+cx+i]=WHITE;
   }
-}
-
-U0 SideRun(I64 x, I64 z, I64 h, I64 faceid, I64 noff)
-{//merge a vertical run of same-block faces (neighbour cell base+noff is air) into ONE tall quad -> far fewer
- //GrFillPoly3 calls for trunks/cliffs/canopy sides. Caller already did the back-face (front-facing) test.
-  I64 y=0, y2, bt, base, b2;
-  while (y<=h) {
-    base = x + WX*(z + WZ*y);
-    bt = g_world[base];
-    if (bt && !g_world[base+noff]) {
-      y2=y;
-      while (y2+1<=h) {
-        b2 = x + WX*(z + WZ*(y2+1));
-        if (g_world[b2]==bt && !g_world[b2+noff]) y2=y2+1; else break;
+  for (blk=8;blk<24;blk++) {
+    px=x0+(blk-8)*bw;
+    c=g_lr[blk*4+2];
+    for (py=y0;py<y0+bh;py++)
+      for (qx=px+gap;qx<px+bw-gap;qx++)
+	b[py*wi+qx]=c;
+    if (blk==g_sel)
+      for (qx=px-1;qx<px+bw;qx++) {
+	b[(y0-1)*wi+qx]=WHITE;
+	b[(y0+bh)*wi+qx]=WHITE;
       }
-      DrawFace(x,y,y2,z,faceid,bt);
-      y=y2+1;
-    } else
-      y=y+1;
   }
 }
 
-U0 RenderFaces(CDC *dc)
+#ifdef TOS_NATIVE
+//Every corner of a face is a sum of one share for each of its coordinates,
+//so two faces that meet get the same bits for their common corners.
+F64 g_tfx[WX+1],g_trx[WX+1],g_tux[WX+1],g_tfy[WY+1],g_tuy[WY+1],
+	g_tfz[WZ+1],g_trz[WZ+1],g_tuz[WZ+1],
+	g_vf[4],g_vr[4],g_vu[4],g_wf[8],g_wr[8],g_wu[8],
+	g_pnx[5],g_pnz[5],g_pk[5],g_sx[8],g_sy[8],g_sz[8];
+I64 g_xa,g_xb,g_fog,g_fogc;
+
+U0 SkyRowsMake()
+{//Random rows that blend each pair of sky colors in SKY_LVS steps.
+  I64 i,j,q,p;
+  U8 *dst;
+  if (!g_skyrows)
+    g_skyrows=MAlloc(2*(SKY_LVS+1)*SKY_ROW);
+  dst=g_skyrows;
+  for (i=0;i<2;i++)
+    for (q=0;q<=SKY_LVS;q++) {
+      p=q*65536/SKY_LVS;
+      for (j=0;j<SKY_ROW;j++)
+	if (RandU16<p)
+	  *dst++=g_skyr[i+1];
+	else
+	  *dst++=g_skyr[i];
+    }
+}
+
+U0 SkyFill()
+{//Each row of sky by its height in the middle of the view.
+  I64 sy,lv,q;
+  F64 b,s;
+  U8 *dst=g_win;
+  for (sy=0;sy<g_sh;sy++) {
+    b=(g_cyc-sy)/g_focal;
+    s=2.0-SKY_K*(g_fwy+g_upy*b)/Sqrt(1.0+b*b);
+    if (s<=0)
+      MemSet(dst,g_skyr[0],g_sw);
+    else if (s>=2 || g_sw>SKY_ROW-64)
+      MemSet(dst,g_skyr[2],g_sw);
+    else {
+      lv=s;
+      q=(s-lv)*SKY_LVS+0.5;
+      q=(lv*(SKY_LVS+1)+q)*SKY_ROW;
+      q+=RandU16&63;
+      MemCpy(dst,g_skyrows+q,g_sw);
+    }
+    dst+=g_rdc->width_internal;
+  }
+}
+
+U0 ViewMake()
+{//Corner shares and the planes that bound the view, for this frame.
+  I64 i;
+  F64 t,th=(g_sw/2.0+2)/g_focal,tv=(g_sh/2.0+2)/g_focal,ny,ylo,yhi;
+  for (i=0;i<=WX;i++) {
+    t=i-g_cox;
+    g_tfx[i]=t*g_fwx; g_trx[i]=t*g_rgx; g_tux[i]=t*g_upx;
+  }
+  for (i=0;i<=WY;i++) {
+    t=i-g_coy;
+    g_tfy[i]=t*g_fwy; g_tuy[i]=t*g_upy;
+  }
+  for (i=0;i<=WZ;i++) {
+    t=i-g_coz;
+    g_tfz[i]=t*g_fwz; g_trz[i]=t*g_rgz; g_tuz[i]=t*g_upz;
+  }
+  ylo=g_ylo-g_coy;
+  yhi=g_yhi-g_coy;
+  for (i=0;i<5;i++) {
+    switch (i) {
+      case 0: //In front.
+	g_pnx[i]=g_fwx; g_pnz[i]=g_fwz; ny=g_fwy;
+	break;
+      case 1: //Not off the left, and so on.
+	g_pnx[i]=g_rgx+th*g_fwx; g_pnz[i]=g_rgz+th*g_fwz; ny=th*g_fwy;
+	break;
+      case 2:
+	g_pnx[i]=th*g_fwx-g_rgx; g_pnz[i]=th*g_fwz-g_rgz; ny=th*g_fwy;
+	break;
+      case 3:
+	g_pnx[i]=g_upx+tv*g_fwx; g_pnz[i]=g_upz+tv*g_fwz; ny=g_upy+tv*g_fwy;
+	break;
+      case 4:
+	g_pnx[i]=tv*g_fwx-g_upx; g_pnz[i]=tv*g_fwz-g_upz; ny=tv*g_fwy-g_upy;
+	break;
+    }
+    g_pk[i]=Max(ny*ylo,ny*yhi)-g_pnx[i]*g_cox-g_pnz[i]*g_coz+
+	  Max(g_pnx[i],0)+Max(g_pnz[i],0);
+  }
+}
+
+Bool RowSpan(I64 z,F64 dz,F64 rr)
+{//The columns of row z that can hold a face in view, g_xa to g_xb.
+  I64 i;
+  F64 half=Sqrt(rr-dz*dz),c,v;
+  g_xa=ClampI64(Floor(g_cox-0.5-half),0,WX-1);
+  g_xb=ClampI64(Floor(g_cox-0.5+half)+1,0,WX-1);
+  for (i=0;i<5;i++) {
+    c=g_pk[i]+g_pnz[i]*z;
+    if (g_pnx[i]>0) {
+      v=Clamp(-c/g_pnx[i],-2.0,WX+1.0);
+      g_xa=MaxI64(g_xa,Floor(v));
+    } else if (g_pnx[i]<0) {
+      v=Clamp(-c/g_pnx[i],-2.0,WX+1.0);
+      g_xb=MinI64(g_xb,Floor(v));
+    } else if (c<0)
+      return FALSE;
+  }
+  return g_xa<=g_xb;
+}
+
+U0 Corner(I64 i,I64 x,I64 y,I64 z)
 {
-  I64 need, R, bix, biz, xa, xb, za, zb, x, z, y, h, bt, bidx;
-  F64 hw, hh, rcx, rcz, fdc, prp;
-  g_rdc = dc;
-  SetupCam();                                   // camera basis + g_bix/g_biz (ProjPt reads the basis)
-  g_sw=dc->width; g_sh=dc->height;
-  hw=g_sw;  hw=hw/2.0;  g_cxc=hw;
-  hh=g_sh;  hh=hh/2.0;  g_cyc=hh;
-  g_focal = hh / 1.05;                           // (H/2)/fov : same view as RenderRows (fov=1.05)
-  need = dc->width_internal * dc->height;
-  if (need > g_depthcap) return;
-  dc->depth_buf = g_depth;                       // attach our z-buffer ...
-  MemSetU32(g_depth, I32_MAX, need);             // ... cleared to "far away"
-  MemSet(dc->body, 11, need);                    // sky (ltcyan); faces overwrite it
-  R=RDIST; bix=g_bix; biz=g_biz;
-  xa=bix-R; xb=bix+R; za=biz-R; zb=biz+R;
-  if (xa<1) xa=1;  if (xb>WX-2) xb=WX-2;
-  if (za<1) za=1;  if (zb>WZ-2) zb=WZ-2;
-  for (z=za; z<=zb; z++)
-    for (x=xa; x<=xb; x++) {
-      rcx = x - g_px;  rcz = z - g_pz;            // frustum cull: skip columns behind OR well outside the FOV cone
-      fdc = rcx*g_fwx + rcz*g_fwz;                 //   forward distance (along the look direction)
-      prp = rcx*g_rgx + rcz*g_rgz; if (prp<0.0) prp=-prp;   // |sideways| distance (the right axis)
-      if (fdc >= -2.0 && prp <= fdc*3.0 + 8.0) {  // cone widens with distance (generous margin -> no edge pop)
-        h = g_hm[x+WX*z];                          // top solid cell of this column (nothing solid above it)
-        for (y=0; y<=h; y++) {                     // TOP/BOTTOM faces per cell (horizontal -> can't vertical-merge)
-          bidx = x + WX*(z + WZ*y);                // (buried interior cells here are just cheap reads)
-          bt = g_world[bidx];
-          if (bt) {                                // x in [1,WX-2], z in [1,WZ-2] -> x/z neighbours in-bounds
-            if ((y>=WY-1 || !g_world[bidx + WX*WZ]) && g_py>y+1) DrawFace(x,y,y,z,3,bt);   // +Y top
-            if (y>0 && !g_world[bidx - WX*WZ]       && g_py<y)   DrawFace(x,y,y,z,2,bt);   // -Y bottom
-          }
-        }
-        if (g_px<x)   SideRun(x,z,h,0,-1);          // SIDE faces: merge each vertical run into ONE tall quad
-        if (g_px>x+1) SideRun(x,z,h,1,+1);          //   (-X +X -Z +Z; neighbour offset -1 +1 -WX +WX)
-        if (g_pz<z)   SideRun(x,z,h,4,-WX);
-        if (g_pz>z+1) SideRun(x,z,h,5,+WX);
+  g_vf[i]=g_tfx[x]+g_tfy[y]+g_tfz[z];
+  g_vr[i]=g_trx[x]+g_trz[z];
+  g_vu[i]=g_tux[x]+g_tuy[y]+g_tuz[z];
+}
+
+I64 NearCut()
+{//Corners g_vf, g_vr, g_vu, cut where the face is nearer than NEAR, into g_w*.
+  I64 i,j,n=0;
+  F64 t;
+  for (i=0;i<4;i++) {
+    j=i+1;
+    if (j==4) j=0;
+    if (g_vf[i]>=NEAR) {
+      g_wf[n]=g_vf[i]; g_wr[n]=g_vr[i]; g_wu[n]=g_vu[i]; n++;
+      if (g_vf[j]<NEAR) {
+	t=(g_vf[i]-NEAR)/(g_vf[i]-g_vf[j]);
+	g_wf[n]=NEAR;
+	g_wr[n]=g_vr[i]+t*(g_vr[j]-g_vr[i]);
+	g_wu[n]=g_vu[i]+t*(g_vu[j]-g_vu[i]);
+	n++;
+      }
+    } else if (g_vf[j]>=NEAR) {
+      t=(g_vf[j]-NEAR)/(g_vf[j]-g_vf[i]);
+      g_wf[n]=NEAR;
+      g_wr[n]=g_vr[j]+t*(g_vr[i]-g_vr[j]);
+      g_wu[n]=g_vu[j]+t*(g_vu[i]-g_vu[j]);
+      n++;
+    }
+  }
+  return n;
+}
+
+U0 FaceFill(I64 color,I64 prob)
+{//Subpixel edges share pixel centers; reciprocal depth is linear in x,y.
+  I64 i,j,n=NearCut,x1,x2,y,y1,y2,ya,yb,z1,z2,ex,dx,*dst;
+  F64 inv,ax,ay,bx,by,a,zx=0,zy=0,z0,ymin=I32_MAX,ymax=I32_MIN,
+	slope,x,z;
+  if (n<3) return;
+  for (i=0;i<n;i++) {
+    inv=1.0/g_wf[i];
+    g_sx[i]=g_cxc+g_wr[i]*g_focal*inv;
+    g_sy[i]=g_cyc-g_wu[i]*g_focal*inv;
+    g_sz[i]=ZFAR-g_zk*inv;
+    if (g_sy[i]<ymin) ymin=g_sy[i];
+    if (g_sy[i]>ymax) ymax=g_sy[i];
+  }
+  y1=MaxI64(Ceil(ymin-0.5),0);
+  y2=MinI64(Ceil(ymax-0.5)-1,g_sh-1);
+  if (y1>y2) return;
+  for (i=1;i<n-1;i++) {
+    ax=g_sx[i]-g_sx[0]; ay=g_sy[i]-g_sy[0];
+    bx=g_sx[i+1]-g_sx[0]; by=g_sy[i+1]-g_sy[0];
+    a=ax*by-ay*bx;
+    if (Abs(a)>0.000001) {
+      zx=((g_sz[i]-g_sz[0])*by-(g_sz[i+1]-g_sz[0])*ay)/a;
+      zy=(ax*(g_sz[i+1]-g_sz[0])-bx*(g_sz[i]-g_sz[0]))/a;
+      break;
+    }
+  }
+  if (i==n-1) return;
+  for (i=0;i<n;i++) {
+    j=i+1; if (j==n) j=0;
+    if (g_sy[i]!=g_sy[j]) {
+      if (g_sy[j]>g_sy[i]) {
+	ya=MaxI64(Ceil(g_sy[i]-0.5),0);
+	yb=MinI64(Ceil(g_sy[j]-0.5)-1,g_sh-1);
+      } else {
+	ya=MaxI64(Ceil(g_sy[j]-0.5),0);
+	yb=MinI64(Ceil(g_sy[i]-0.5)-1,g_sh-1);
+      }
+      slope=(g_sx[j]-g_sx[i])/(g_sy[j]-g_sy[i]);
+      x=g_sx[i]+(ya+0.5-g_sy[i])*slope-0.5;
+      ex=Floor(x*4294967296.0);
+      dx=slope*4294967296.0;
+      if (g_sy[j]>g_sy[i] ^^ a<0)
+	dst=g_right;
+      else
+	dst=g_left;
+      for (y=ya;y<=yb;y++) {
+	dst[y]=(ex+0xFFFFFFFF)>>32;
+	ex+=dx;
       }
     }
-  dc->depth_buf = NULL;                           // detach (the buffer is ours; DCDel must not free it)
-}
-
-U0 DrawHUDDC(CDC *dc)
-{//crosshair + hotbar straight into the window body (2D, on top of the rendered world)
-  U8 *b=dc->body;
-  I64 W=dc->width, H=dc->height, st=dc->width_internal, cx=W/2, cy=H/2, i;
-  I64 aw=W/110, t; if (aw<4) aw=4;                           // Latin (Christian) cross crosshair (aim at the crossing)
-  for (t=0; t<2; t++) {
-    for (i=-aw; i<=aw*3; i++) b[(cy+i)*st + cx+t]=15;        // vertical stem
-    for (i=-aw; i<=aw;   i++) b[(cy+t)*st + cx+i]=15;        // crossbar (near the top)
   }
-  I64 nb=16, bw=W/17, gap=bw/8, bsel;
-  if (gap<1) gap=1;
-  I64 bh=bw*3/4, x0=(W-nb*bw)/2, y0=H-bh-bh/3;
-  for (bsel=0; bsel<nb; bsel++) {
-    I64 blk=8+bsel, px=x0+bsel*bw, py, qx, c=g_lr[blk*4+2];
-    for (py=y0; py<y0+bh; py++)
-      for (qx=px+gap; qx<px+bw-gap; qx++) b[py*st+qx]=c;
-    if (blk==g_sel)
-      for (qx=px-1; qx<px+bw; qx++) { b[(y0-1)*st+qx]=15; b[(y0+bh)*st+qx]=15; }
+  z0=g_sz[0]-zx*(g_sx[0]-0.5)-zy*(g_sy[0]-0.5);
+  g_rdc->color=color;
+  g_rdc->dither_probability_u16=prob;
+  for (y=y1;y<=y2;y++) {
+    x1=g_left[y]; x2=g_right[y]-1;
+    if (x1<0) x1=0;
+    if (x2>=g_sw) x2=g_sw-1;
+    if (x1<=x2) {
+      z=z0+zy*y;
+      z1=z+zx*x1;
+      z2=z+zx*x2;
+      if (z1<0) z1=0;
+      if (z2<0) z2=0;
+      GrHLine(g_rdc,x1,x2,y,z1,z2);
+    }
   }
 }
 
-// real TempleOS calls this each refresh with the window DC -> render the world fresh, Varoom-style.
-U0 DrawIt(CTask *task, CDC *dc)
-{
-  no_warn task;
-  if (!g_world) return;
-  RenderFaces(dc);
-  DrawHUDDC(dc);
+Bool FaceMatch(I64 x,I64 y,I64 z,I64 face,I64 block)
+{//Coplanar faces may join before fog starts; their light is identical.
+  I64 c=x+WX*(z+WZ*y);
+  F64 dx=x+0.5-g_cox,dy=y+0.5-g_coy,dz=z+0.5-g_coz;
+  if (dx*dx+dy*dy+dz*dz>=FOG0*FOG0 || g_world[c]!=block)
+    return FALSE;
+  switch (face) {
+    case 0: return !g_world[c-1];
+    case 1: return !g_world[c+1];
+    case 2: return !g_world[c-WX*WZ];
+    case 3: return y==WY-1 || !g_world[c+WX*WZ];
+    case 4: return !g_world[c-WX];
+    case 5: return !g_world[c+WX];
+  }
+  return FALSE;
+}
+
+U0 CellFace(I64 x,I64 y,I64 z,I64 face,I64 k)
+{//One face of the block at x,y,z, k its block and face.
+  I64 col,x1=x+1,y1=y+1,block=k/6;
+  if (!g_fog) {
+    if (face==2 || face==3) {
+      if (x>g_xa && FaceMatch(x-1,y,z,face,block)) return;
+      while (x1<=g_xb && FaceMatch(x1,y,z,face,block))
+	x1++;
+    } else {
+      if (y>g_lo[x+WX*z] && FaceMatch(x,y-1,z,face,block)) return;
+      while (y1<=g_hm[x+WX*z] && FaceMatch(x,y1,z,face,block))
+	y1++;
+    }
+  }
+  switch (face) {
+    case 0:
+    case 1:
+      x+=face;
+      Corner(0,x,y,z); Corner(1,x,y1,z);
+      Corner(2,x,y1,z+1); Corner(3,x,y,z+1);
+      break;
+    case 2:
+    case 3:
+      y+=face-2;
+      Corner(0,x,y,z); Corner(1,x1,y,z);
+      Corner(2,x1,y,z+1); Corner(3,x,y,z+1);
+      break;
+    case 4:
+    case 5:
+      z+=face-4;
+      Corner(0,x,y,z); Corner(1,x+1,y,z);
+      Corner(2,x+1,y1,z); Corner(3,x,y1,z);
+      break;
+  }
+  if (g_fog) {
+    if (g_fthr[k]>=32768)
+      col=g_fhi[k];
+    else
+      col=g_flo[k];
+    FaceFill(ROPF_PROBABILITY_DITHER|g_fogc<<16|col,g_fog);
+  } else
+    FaceFill(ROPF_PROBABILITY_DITHER|g_fhi[k]<<16|g_flo[k],g_fthr[k]);
+}
+
+U0 FogSet(F64 d2,F64 dy)
+{//How far the block at d2, the square of its distance, has faded.
+  F64 d,s;
+  if (d2<FOG0*FOG0)
+    g_fog=0;
+  else {
+    d=Sqrt(d2);
+    g_fog=ClampI64((d-FOG0)*65536/(RDIST-FOG0),1,65535);
+    s=2.0-SKY_K*dy/d;
+    if (s>=1.5)
+      g_fogc=g_skyr[2];
+    else if (s>=0.5)
+      g_fogc=g_skyr[1];
+    else
+      g_fogc=g_skyr[0];
+  }
+}
+
+U0 ColFaces(I64 x,I64 z,F64 dxz2)
+{//The faces of column x,z that are open to the air and look at the eye.
+  I64 y,h,k,c=x+WX*z;
+  F64 dy,d2,far2=(RDIST+0.87)*(RDIST+0.87);
+  U8 *w;
+  h=g_hm[c];
+  y=g_lo[c];
+  w=g_world+c+WX*WZ*y;
+  while (y<=h) {
+    if (*w) {
+      dy=y+0.5-g_coy;
+      d2=dxz2+dy*dy;
+      if (d2<far2) {
+	FogSet(d2,dy);
+	k=*w*6;
+	if (g_coy>y+1 && (y==WY-1 || !w[WX*WZ]))
+	  CellFace(x,y,z,3,k+3);
+	if (g_coy<y && y && !w[-WX*WZ])
+	  CellFace(x,y,z,2,k+2);
+	if (g_cox<x && x && !w[-1])
+	  CellFace(x,y,z,0,k);
+	if (g_cox>x+1 && x<WX-1 && !w[1])
+	  CellFace(x,y,z,1,k+1);
+	if (g_coz<z && z && !w[-WX])
+	  CellFace(x,y,z,4,k+4);
+	if (g_coz>z+1 && z<WZ-1 && !w[WX])
+	  CellFace(x,y,z,5,k+5);
+      }
+    }
+    y++;
+    w+=WX*WZ;
+  }
+}
+
+Bool RenderFaces(CDC *dc)
+{//The sky, then every face on air that looks at the eye, over a depth buffer.
+  I64 need=dc->width_internal*dc->height,x,z;
+  F64 dx,dz,rr=(RDIST+0.75)*(RDIST+0.75);
+  if (need<=0) return FALSE;
+  if (need>g_depthcap) {
+    Free(g_depth);
+    g_depth=MAlloc(need*sizeof(I32));
+    g_depthcap=need;
+  }
+  g_sw=dc->width; g_sh=dc->height;
+  if (g_sh>g_edgecap) {
+    Free(g_left);
+    g_left=MAlloc(g_sh*2*sizeof(I64));
+    g_right=g_left+g_sh;
+    g_edgecap=g_sh;
+  }
+  g_win=dc->body;
+  g_rdc=dc;
+  SetupCam;
+  g_cxc=g_sw/2.0;
+  g_cyc=g_sh/2.0;
+  g_focal=g_sh/2.0/FOV;
+  g_zk=ZFAR*NEAR;
+  dc->depth_buf=g_depth;
+  MemSetU32(g_depth,I32_MAX,need);
+  SkyFill;
+  ViewMake;
+  for (z=0;z<WZ;z++) {
+    dz=z+0.5-g_coz;
+    if (dz*dz<rr && RowSpan(z,dz,rr))
+      for (x=g_xa;x<=g_xb;x++) {
+	dx=x+0.5-g_cox;
+	ColFaces(x,z,dx*dx+dz*dz);
+      }
+  }
+  dc->depth_buf=NULL; //The buffer is ours: DCDel must not free it.
+  return TRUE;
+}
+
+U0 DrawIt(CTask *task,CDC *dc)
+{//Draw into a private DC; GrBlot clips windows and respects coverage.
+  I64 w=task->pix_width,h=task->pix_height;
+  if (w<=0 || h<=0) return;
+  if (!g_view || g_view->width!=w || g_view->height!=h) {
+    DCDel(g_view);
+    g_view=DCNew(w,h);
+    g_view->flags|=DCF_NO_TRANSPARENTS;
+  }
+  if (RenderFaces(g_view)) {
+    DrawHUD(g_win,g_sw,g_sh,g_view->width_internal);
+    GrBlot(dc,0,0,g_view);
+  }
 }
 #else
 F64 g_ent_t0,g_ent_t1;
@@ -752,89 +1066,83 @@ U0 RenderFrame()
   }
 }
 
-U0 DrawHUD()
-{
-  I64 cx=RES_W/2, cy=RES_H/2, i;
-  I64 aw=RES_W/110, t; if (aw<4) aw=4;                       // crosshair = a Latin (Christian) cross: short top + crossbar, long lower stem; you aim at the crossing
-  for (t=0; t<2; t++) {                                       // 2px thick
-    for (i=-aw; i<=aw*3; i++) g_fb[(cy+i)*RES_W + cx+t]=15;   // vertical stem (top stub aw, lower stem 3aw)
-    for (i=-aw; i<=aw;   i++) g_fb[(cy+t)*RES_W + cx+i]=15;   // crossbar (near the top)
-  }
-  // hotbar: 7 swatches along the bottom, sized RELATIVE to the resolution (so it isn't huge at low res
-  // or invisible at high res). gap framing inside each cell; selected one framed white.
-  I64 nb=16, bw=RES_W/17, gap=bw/8, b;                       // 16 placeable blocks = the palette colours (8..23)
-  if (gap<1) gap=1;
-  I64 bh=bw*3/4, x0=(RES_W-nb*bw)/2, y0=RES_H-bh-bh/3;       // squarish swatches near the bottom
-  for (b=0; b<nb; b++) {
-    I64 blk=8+b, px=x0+b*bw, py, qx;
-    I64 c=g_lr[blk*4+2];                                     // representative shade of the colour block
-    for (py=y0; py<y0+bh; py++)
-      for (qx=px+gap; qx<px+bw-gap; qx++) g_fb[py*RES_W+qx]=c;
-    if (blk==g_sel)
-      for (qx=px-1; qx<px+bw; qx++) { g_fb[(y0-1)*RES_W+qx]=15; g_fb[(y0+bh)*RES_W+qx]=15; }
-  }
-}
-
-U0 Present(CDC *dc)
-{
-  GrSprite(dc, 0, 0, g_fb, RES_W, RES_H, SCALE);   // holyc-wasm blits the 8-bit buffer
-}
 #endif
+
+U0 CleanUp()
+{
+  Free(g_world); g_world=NULL;
+  Free(g_hm); g_hm=NULL;
+  Free(g_lo); g_lo=NULL;
+#ifdef TOS_NATIVE
+  DCDel(g_view); g_view=NULL;
+  Free(g_depth); g_depth=NULL; g_depthcap=0;
+  Free(g_skyrows); g_skyrows=NULL;
+  Free(g_left); g_left=NULL; g_right=NULL; g_edgecap=0;
+#else
+  Free(g_fb); g_fb=NULL;
+#endif
+}
 
 U0 HolyCraft()
 {
 #ifdef TOS_NATIVE
   SettingsPush;
-  AutoComplete(OFF);            // don't pop the completion box while we read keys
-  WinBorder(OFF);
+  AutoComplete;
+  WinBorder;
   WinMax;
-  DocCursor(OFF);
+  DocCursor;
   DocClear;
-  // Inhibit the window manager from acting on clicks (no window close/drag/menu/double-click) while we play
-  // - exactly what real-time apps do (reference ToTheFront.HC:135, MassSpring.HC). Clicks still set
-  // ms.lb/ms.rb so break/place keep working, but a stray click can no longer drop you out of the game.
-  Fs->win_inhibit|=WIF_SELF_MS_L|WIF_SELF_MS_R|WIG_DBL_CLICK;
-  Init();
-  // precompute the held-key scancodes once (Char2ScanCode is slow), then CLEAR any of them the kernel still
-  // has marked "down" from the launch keystrokes (the 'a' in "HolyCraft.HC" etc.) and FLUSH their messages,
-  // so you spawn standing still instead of strafing. This is the base-TempleOS stand-in for KeyStateRst.
-  g_scw=Char2ScanCode('w'); g_scs=Char2ScanCode('s'); g_sca=Char2ScanCode('a'); g_scd=Char2ScanCode('d');
-  g_scr=Char2ScanCode('r'); g_scf=Char2ScanCode('f'); g_scj=Char2ScanCode('j'); g_scl=Char2ScanCode('l');
+//The WinMgr leaves clicks to the game, and no Ctrl drag may scroll the
+  //window: the faces would slide off the sky and the cross.
+  Fs->win_inhibit|=WIF_SELF_MS_L|WIF_SELF_MS_R|WIG_DBL_CLICK|
+	WIF_SELF_GRAB_SCROLL;
+  Init;
+  SkyRowsMake;
+//Clear keys left down from the launch command.
+  g_scw=Char2ScanCode('w'); g_scs=Char2ScanCode('s');
+  g_sca=Char2ScanCode('a'); g_scd=Char2ScanCode('d');
+  g_scr=Char2ScanCode('r'); g_scf=Char2ScanCode('f');
+  g_scj=Char2ScanCode('j'); g_scl=Char2ScanCode('l');
   g_sci=Char2ScanCode('i'); g_sck=Char2ScanCode('k');
-  LBtr(kbd.down_bitmap,g_scw); LBtr(kbd.down_bitmap,g_scs); LBtr(kbd.down_bitmap,g_sca);
-  LBtr(kbd.down_bitmap,g_scd); LBtr(kbd.down_bitmap,g_scr); LBtr(kbd.down_bitmap,g_scf);
-  LBtr(kbd.down_bitmap,g_scj); LBtr(kbd.down_bitmap,g_scl); LBtr(kbd.down_bitmap,g_sci);
+  LBtr(kbd.down_bitmap,g_scw); LBtr(kbd.down_bitmap,g_scs);
+  LBtr(kbd.down_bitmap,g_sca);
+  LBtr(kbd.down_bitmap,g_scd); LBtr(kbd.down_bitmap,g_scr);
+  LBtr(kbd.down_bitmap,g_scf);
+  LBtr(kbd.down_bitmap,g_scj); LBtr(kbd.down_bitmap,g_scl);
+  LBtr(kbd.down_bitmap,g_sci);
   LBtr(kbd.down_bitmap,g_sck);
   FlushMsgs;
   MsSet(320,240);
   BrowserMouseCapture=1;
-  Fs->draw_it=&DrawIt;          // the WinMgr now renders the world (faces) to the screen DC every refresh
+  Fs->draw_it=&DrawIt;
   try {
     while (!g_quit) {
-      HandleInput();            // input + physics only; DrawIt does all the rendering (Varoom-style)
+      HandleInput;
       Sleep(16);
     }
   } catch
     PutExcept;
-  Fs->draw_it=NULL;
   BrowserMouseCapture=0;
-  Fs->win_inhibit=WIG_USER_TASK_DFT;   // hand mouse handling back to the window manager
-  DocClear;
   SettingsPop;
+  CleanUp;
 #else
-  Init();
-  BrowserMouseCapture=1;
   CDC *dc=DCAlias;
-  while (!g_quit) {
-    HandleInput();
-    RenderFrame();
-    DrawHUD();
-    Present(dc);
-    Sleep(16);
-  }
-  DCFill(dc, BLACK);
+  Init;
+  BrowserMouseCapture=1;
+  try {
+    while (!g_quit) {
+      HandleInput;
+      RenderFrame;
+      DrawHUD(g_fb,RES_W,RES_H,RES_W);
+      GrSprite(dc,0,0,g_fb,RES_W,RES_H,SCALE);
+      Sleep(16);
+    }
+  } catch
+    PutExcept;
+  DCFill(dc,BLACK);
   BrowserMouseCapture=0;
-  "HolyCraft: thanks for playing!\n";
+  DCDel(dc);
+  CleanUp;
 #endif
 }
 

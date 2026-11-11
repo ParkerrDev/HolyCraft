@@ -5,7 +5,8 @@ ones in any of the 16 system colors. One source file, `HolyCraft.HC`, builds two
 
 - **TempleOS V5.03** (with `TOS_NATIVE` defined): draws through the window's `draw_it` callback, reads
   the keyboard from `kbd.down_bitmap` and `ScanMsg`, and renders the world's exposed block faces as
-  z-buffered polygons with `GrFillPoly3`.
+  near-clipped, subpixel spans with reciprocal depth and `GrHLine`. A private drawing context
+  lets the TempleOS compositor clip moving windows; resizing grows its buffers as needed.
 - **The browser**, compiled to WebAssembly by [HolyC-wasm](https://github.com/ParkerrDev/HolyC-wasm): a
   per-pixel voxel raycaster presented with `GrSprite`, with mouse look through the `Browser*` globals
   below. This is the build [TempleOS-Web](https://github.com/ParkerrDev/TempleOS-Web) plays in its Games
@@ -51,6 +52,8 @@ game through four globals:
 ```sh
 node tools/input.test.mjs
 node tools/physics.test.mjs
+node tools/window.test.mjs
+node tools/render/web.mjs check
 ```
 
 They compile the browser build with HolyC-wasm and run it on a clock they move. The input test checks
@@ -58,4 +61,45 @@ that a still mouse leaves the camera still, one mouse move turns it once, a held
 letting go stops it. The physics test checks that the player walks as far in a second at 10 frames a
 second as at 60, that the player's box keeps the eye out of walls, ceilings and the world's edges, and
 that a block is not placed where the player stands. They find HolyC-wasm in `$HOLYC_WASM` or beside
-this repository (`../HolyC-wasm`), and skip when it is not there.
+this repository (`../HolyC-wasm`). A missing compiler fails the checks. The window check guards
+the HUD buffer and row padding at seven sizes, and checks that cleanup followed by Init restarts
+the game. The renderer check compares all visible faces before fog with independent exact rays
+at 48 fixed and seeded camera poses, including close walls, ceilings and world boundaries.
+
+
+The native checks use the actual TempleOS V5.03 compiler and drawing routines inside HEMU. They
+need a TempleOS-Web checkout with its HEMU and HolyC-wasm dependencies, tracked snapshot/disk,
+and `tools/hemu/Fixtures.mjs`:
+
+```sh
+export TEMPLEOS_WEB=/path/to/TempleOS-Web
+node --max-old-space-size=3072 tools/render/tos.mjs check
+HLE=0 node --max-old-space-size=3072 tools/render/tos.mjs check
+node --max-old-space-size=3072 tools/render/tos.mjs windows
+```
+
+The native ray comparison covers 45 poses. Three browser stress poses put the eye inside a
+solid block, which the player box prevents during play; the native exposed-face renderer does
+not support those poses. Colors identify each material and face, avoiding random dither in the
+comparison. The depth check also detects a nearer surface incorrectly hidden by a farther one.
+The native limit is 0.87 cells before fog starts because fog is selected at each block's center.
+`HLE=0` disables raster acceleration and asserts that it stayed disabled. The `windows` check
+compares DrawIt with a separately rendered view at seven sizes, including odd widths and repeated
+growth/shrink. It does not substitute for testing actual window occlusion in QEMU or on hardware.
+
+To measure rendering on the current machine:
+
+```sh
+node tools/render/web.mjs bench
+N=15 node --max-old-space-size=3072 tools/render/tos.mjs time
+```
+
+`SRC` can select a different HolyCraft source for a regression comparison. `POSE` selects one
+native check pose; `OUT` saves its frame, depth and world arrays for diagnosis. `LIVE` and `RAW`
+can select alternate snapshot/disk fixtures. No test writes to the bundled disk image.
+
+Native rendering performance is still being optimized. The precise scanline renderer fixes
+missing blocks, but it is slower in HEMU than the earlier integer polygon path. Passing these
+checks establishes the listed cases, not universal parity or a frame-rate guarantee across
+QEMU, VirtualBox, VMware and bare metal. The native and browser rendering/input adapters still
+differ; replacing them with one native API path depends on HolyC-wasm runtime support.
