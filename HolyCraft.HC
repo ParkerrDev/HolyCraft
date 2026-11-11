@@ -720,6 +720,8 @@ U0 FaceFill(I64 color,I64 prob)
     }
   }
   z0=g_sz[0]-zx*(g_sx[0]-0.5)-zy*(g_sy[0]-0.5);
+  if (color.u8[0]==color.u8[2])
+    color&=~ROPF_PROBABILITY_DITHER;
   g_rdc->color=color;
   g_rdc->dither_probability_u16=prob;
   for (y=y1;y<=y2;y++) {

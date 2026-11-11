@@ -119,6 +119,8 @@ can select alternate snapshot/disk fixtures. No test writes to the bundled disk 
 The timing mode retains the game's actual material and sky colors. The geometry checks
 replace them with face-identifying colors; those diagnostic colors must not be used to
 measure optimizations that depend on whether two shades are equal.
+Equal face shades use solid drawing. This preserves their color while consuming fewer
+random values, so subsequent dither and sky noise need not match an older seeded frame.
 
 Native rendering performance is still being optimized. The precise scanline renderer fixes
 missing blocks, but it is slower in HEMU than the earlier integer polygon path. Passing these
