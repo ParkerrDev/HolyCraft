@@ -82,9 +82,10 @@ The native ray comparison covers 45 poses. Three browser stress poses put the ey
 solid block, which the player box prevents during play; the native exposed-face renderer does
 not support those poses. Colors identify each material and face, avoiding random dither in the
 comparison. Matching pre-fog faces also have their integer reciprocal depths
-checked against the independent rays: endpoint truncation and GrHLine's 32.32
-interpolation allow an error from -2 to 0 depth units, plus a 0.0001-unit floating-point
-margin. This is separate from the visibility classifier's looser distance tolerance;
+checked against the independent rays: endpoint truncation and interpolation
+flooring allow an error from -2 to 0 depth units, plus a 0.0001-unit margin for
+32.32 slope quantization and floating-point plane setup in these 640-wide views.
+This is separate from the visibility classifier's looser distance tolerance;
 it checks both displaced-nearer and displaced-farther surfaces. It does not require
 bit-identical depth buffers across different rendering algorithms.
 The native limit is 0.87 cells before fog starts because fog is selected at each block's center.

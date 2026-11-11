@@ -78,8 +78,9 @@ function depthCheck(name, expected, pixels, depth, hard) {
     const hit=expected[i];
     if(!hit||hit.t>=hard||hit.fd<NEAR||pixels[i]!==hit.code)continue;
     const error=depth[i]-ZFAR*(1-NEAR/hit.fd);
-    // Endpoint truncation and native GrHLine's 32.32 interpolation each lose
-    // less than one depth unit. The margin covers floating-point plane setup.
+    // Endpoint truncation and interpolation flooring lose up to two units.
+    // At 640 pixels, 32.32 slope quantization adds <639/2^32 unit; the margin
+    // covers that and floating-point plane setup in these tested views.
     assert(error>=-2.0001&&error<=0.0001,
       `${name} at ${i%W},${Math.floor(i/W)}: integer depth error ${error}`);
     low=Math.min(low,error);high=Math.max(high,error);count++;
