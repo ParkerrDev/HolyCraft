@@ -518,7 +518,7 @@ F64 g_tfx[WX+1],g_trx[WX+1],g_tux[WX+1],g_tfy[WY+1],g_tuy[WY+1],
 	g_tfz[WZ+1],g_trz[WZ+1],g_tuz[WZ+1],
 	g_vf[4],g_vr[4],g_vu[4],g_wf[8],g_wr[8],g_wu[8],
 	g_pnx[5],g_pnz[5],g_pk[5],g_sx[8],g_sy[8],g_sz[8];
-I64 g_xa,g_xb,g_fog,g_fogc;
+I64 g_xa,g_xb,g_fog,g_fogc,g_syi[8];
 
 U0 SkyRowsMake()
 {//Random rows that blend each pair of sky colors in SKY_LVS steps.
@@ -658,20 +658,30 @@ I64 NearCut()
 
 U0 FaceFill(I64 color,I64 prob)
 {//Subpixel edges share pixel centers; reciprocal depth is linear in x,y.
-  I64 i,j,n=NearCut,x1,x2,y,y1,y2,ya,yb,z1,z2,reg ex,reg dx,*dst;
-  F64 inv,ax,ay,bx,by,a,zx=0,zy=0,z0,ymin=I32_MAX,ymax=I32_MIN,
-	slope,x,z;
-  if (n<3) return;
-  for (i=0;i<n;i++) {
-    inv=1.0/g_wf[i];
-    g_sx[i]=g_cxc+g_wr[i]*g_focal*inv;
-    g_sy[i]=g_cyc-g_wu[i]*g_focal*inv;
-    g_sz[i]=ZFAR-g_zk*inv;
-    if (g_sy[i]<ymin) ymin=g_sy[i];
-    if (g_sy[i]>ymax) ymax=g_sy[i];
+  I64 i,j,n,x1,x2,y,y1,y2,ya,yb,z1,z2,reg ex,reg dx,*dst,
+	ymin=I64_MAX,ymax=I64_MIN;
+  F64 inv,ax,ay,bx,by,a,zx=0,zy=0,z0,
+	slope,x,z,*vf,*vr,*vu;
+  if (g_vf[0]>=NEAR && g_vf[1]>=NEAR &&
+	g_vf[2]>=NEAR && g_vf[3]>=NEAR) {
+    n=4;
+    vf=g_vf;vr=g_vr;vu=g_vu;
+  } else {
+    n=NearCut;
+    if (n<3) return;
+    vf=g_wf;vr=g_wr;vu=g_wu;
   }
-  y1=MaxI64(Ceil(ymin-0.5),0);
-  y2=MinI64(Ceil(ymax-0.5)-1,g_sh-1);
+  for (i=0;i<n;i++) {
+    inv=1.0/vf[i];
+    g_sx[i]=g_cxc+vr[i]*g_focal*inv;
+    g_sy[i]=g_cyc-vu[i]*g_focal*inv;
+    g_sz[i]=ZFAR-g_zk*inv;
+    g_syi[i]=Ceil(g_sy[i]-0.5);
+    if (g_syi[i]<ymin) ymin=g_syi[i];
+    if (g_syi[i]>ymax) ymax=g_syi[i];
+  }
+  y1=MaxI64(ymin,0);
+  y2=MinI64(ymax-1,g_sh-1);
   if (y1>y2) return;
   for (i=1;i<n-1;i++) {
     ax=g_sx[i]-g_sx[0]; ay=g_sy[i]-g_sy[0];
@@ -688,11 +698,11 @@ U0 FaceFill(I64 color,I64 prob)
     j=i+1; if (j==n) j=0;
     if (g_sy[i]!=g_sy[j]) {
       if (g_sy[j]>g_sy[i]) {
-	ya=MaxI64(Ceil(g_sy[i]-0.5),0);
-	yb=MinI64(Ceil(g_sy[j]-0.5)-1,g_sh-1);
+	ya=MaxI64(g_syi[i],0);
+	yb=MinI64(g_syi[j]-1,g_sh-1);
       } else {
-	ya=MaxI64(Ceil(g_sy[j]-0.5),0);
-	yb=MinI64(Ceil(g_sy[i]-0.5)-1,g_sh-1);
+	ya=MaxI64(g_syi[j],0);
+	yb=MinI64(g_syi[i]-1,g_sh-1);
       }
       slope=(g_sx[j]-g_sx[i])/(g_sy[j]-g_sy[i]);
       x=g_sx[i]+(ya+0.5-g_sy[i])*slope-0.5;
@@ -702,8 +712,9 @@ U0 FaceFill(I64 color,I64 prob)
 	dst=g_right;
       else
 	dst=g_left;
+      dst+=ya;
       for (y=ya;y<=yb;y++) {
-	dst[y]=(ex+0xFFFFFFFF)>>32;
+	*dst++=(ex+0xFFFFFFFF)>>32;
 	ex+=dx;
       }
     }
