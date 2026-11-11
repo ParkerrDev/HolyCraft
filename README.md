@@ -113,6 +113,21 @@ at a game call boundary, tracks owned resources, and checks cleanup or retry. It
 does not inject failures inside the system's `DCNew` allocator. Resize keeps the
 previous resource until its replacement has been allocated successfully.
 
+The browser window check runs the native game in the site's actual one-core and
+four-core worker arrangements, using its installed Playwright/Chromium tools:
+
+```sh
+TEMPLEOS_WEB=/path/to/TempleOS-Web node tools/render/browser.mjs
+```
+
+It waits for the real compositor callback to allocate the game view, observes
+frames reaching the page canvas, sends a held L key through the page, checks the
+native camera response, and exits through the on-screen Escape key. It saves
+before/after screenshots in the printed temporary directory (`OUT` overrides
+that location). This checks the actual window/input/exit path without replacing
+the game's drawing callback. It is not an exact compositor-pixel comparison,
+steady-state FPS measurement, or proof on physical mobile devices.
+
 To measure rendering on the current machine:
 
 ```sh
