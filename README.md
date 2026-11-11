@@ -87,6 +87,19 @@ The native limit is 0.87 cells before fog starts because fog is selected at each
 compares DrawIt with a separately rendered view at seven sizes, including odd widths and repeated
 growth/shrink. It does not substitute for testing actual window occlusion in QEMU or on hardware.
 
+When HolyC-wasm includes the recovered native oracle runner, QEMU can also check eight
+near-clipping/ceiling camera poses using its original TempleOS disk and compiler:
+
+```sh
+node tools/render/qemu.mjs check
+REPEATS=3 node tools/render/qemu.mjs time /path/to/prior/HolyCraft.HC
+```
+
+The QEMU check compares 1,320,325 pre-fog pixels against independent ray results. It uses
+a deterministic scene and reports the QEMU backend plus the path to its execution evidence.
+The timing command warms each renderer, then measures 200 spawn-view frames using guest
+`tS`; `N` changes the frame count. The baseline source must provide the native rendering API.
+
 To measure rendering on the current machine:
 
 ```sh
