@@ -116,6 +116,9 @@ N=15 node --max-old-space-size=3072 tools/render/tos.mjs time
 `SRC` can select a different HolyCraft source for a regression comparison. `POSE` selects one
 native check pose; `OUT` saves its frame, depth and world arrays for diagnosis. `LIVE` and `RAW`
 can select alternate snapshot/disk fixtures. No test writes to the bundled disk image.
+The timing mode retains the game's actual material and sky colors. The geometry checks
+replace them with face-identifying colors; those diagnostic colors must not be used to
+measure optimizations that depend on whether two shades are equal.
 
 Native rendering performance is still being optimized. The precise scanline renderer fixes
 missing blocks, but it is slower in HEMU than the earlier integer polygon path. Passing these

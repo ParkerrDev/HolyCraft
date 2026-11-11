@@ -141,8 +141,10 @@ C1Test;
   if (mode !== 'time') for (const [i, b] of buildScene(world)) u8()[gBase + wp + i] = b;
   const hm = rdPtr(G.g_hm);
   for (let x = 0; x < WX; x++) for (let z = 0; z < WZ; z++) u8()[gBase + hm + x + WX * z] = colTop(world, x, z);
-  for (let k = 0; k < 24 * 6; k++) { u8()[gBase + G.g_flo + k] = CODE0 + k; u8()[gBase + G.g_fhi + k] = CODE0 + k; }
-  for (let k = 0; k < 3; k++) u8()[gBase + G.g_skyr + k] = SKY0 + (mode === 'windows' ? 0 : k);
+  if (mode !== 'time') {
+    for (let k = 0; k < 24 * 6; k++) { u8()[gBase + G.g_flo + k] = CODE0 + k; u8()[gBase + G.g_fhi + k] = CODE0 + k; }
+    for (let k = 0; k < 3; k++) u8()[gBase + G.g_skyr + k] = SKY0 + (mode === 'windows' ? 0 : k);
+  }
   wrI(G.c1_rebuild, 1);
   if (!(await until(() => !rdI(G.c1_rebuild), 4000, 1))) throw new Error('rebuild timed out');
   if (process.env.HLE === '0') {
