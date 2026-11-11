@@ -756,9 +756,9 @@ Bool FaceMatch(I64 x,I64 y,I64 z,I64 face,I64 block)
   return FALSE;
 }
 
-U0 CellFace(I64 x,I64 y,I64 z,I64 face,I64 k)
-{//One face of the block at x,y,z, k its block and face.
-  I64 col,x1=x+1,y1=y+1,block=k/6;
+U0 CellFace(I64 x,I64 y,I64 z,I64 face,I64 block)
+{//An exposed face, joined with neighbors having the same material and light.
+  I64 col,x1=x+1,y1=y+1,k=block*6+face;
   if (!g_fog) {
     if (face==2 || face==3) {
       if (x>g_xa && FaceMatch(x-1,y,z,face,block)) return;
@@ -820,7 +820,7 @@ U0 FogSet(F64 d2,F64 dy)
 
 U0 ColFaces(I64 x,I64 z,F64 dxz2)
 {//The faces of column x,z that are open to the air and look at the eye.
-  I64 y,h,k,c=x+WX*z;
+  I64 y,h,block,c=x+WX*z;
   F64 dy,d2,far2=(RDIST+0.87)*(RDIST+0.87);
   U8 *w;
   h=g_hm[c];
@@ -832,19 +832,19 @@ U0 ColFaces(I64 x,I64 z,F64 dxz2)
       d2=dxz2+dy*dy;
       if (d2<far2) {
 	FogSet(d2,dy);
-	k=*w*6;
+	block=*w;
 	if (g_coy>y+1 && (y==WY-1 || !w[WX*WZ]))
-	  CellFace(x,y,z,3,k+3);
+	  CellFace(x,y,z,3,block);
 	if (g_coy<y && y && !w[-WX*WZ])
-	  CellFace(x,y,z,2,k+2);
+	  CellFace(x,y,z,2,block);
 	if (g_cox<x && x && !w[-1])
-	  CellFace(x,y,z,0,k);
+	  CellFace(x,y,z,0,block);
 	if (g_cox>x+1 && x<WX-1 && !w[1])
-	  CellFace(x,y,z,1,k+1);
+	  CellFace(x,y,z,1,block);
 	if (g_coz<z && z && !w[-WX])
-	  CellFace(x,y,z,4,k+4);
+	  CellFace(x,y,z,4,block);
 	if (g_coz>z+1 && z<WZ-1 && !w[WX])
-	  CellFace(x,y,z,5,k+5);
+	  CellFace(x,y,z,5,block);
       }
     }
     y++;
