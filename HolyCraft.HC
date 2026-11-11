@@ -854,18 +854,21 @@ U0 ColFaces(I64 x,I64 z,F64 dxz2)
 
 Bool RenderFaces(CDC *dc)
 {//The sky, then every face on air that looks at the eye, over a depth buffer.
-  I64 need=dc->width_internal*dc->height,x,z;
+  I64 need=dc->width_internal*dc->height,x,z,*edges;
+  I32 *depth;
   F64 dx,dz,rr=(RDIST+0.75)*(RDIST+0.75);
   if (need<=0) return FALSE;
   if (need>g_depthcap) {
+    depth=MAlloc(need*sizeof(I32));
     Free(g_depth);
-    g_depth=MAlloc(need*sizeof(I32));
+    g_depth=depth;
     g_depthcap=need;
   }
   g_sw=dc->width; g_sh=dc->height;
   if (g_sh>g_edgecap) {
+    edges=MAlloc(g_sh*2*sizeof(I64));
     Free(g_left);
-    g_left=MAlloc(g_sh*2*sizeof(I64));
+    g_left=edges;
     g_right=g_left+g_sh;
     g_edgecap=g_sh;
   }
@@ -895,11 +898,13 @@ Bool RenderFaces(CDC *dc)
 U0 DrawIt(CTask *task,CDC *dc)
 {//Draw into a private DC; GrBlot clips windows and respects coverage.
   I64 w=task->pix_width,h=task->pix_height;
+  CDC *view;
   if (w<=0 || h<=0) return;
   if (!g_view || g_view->width!=w || g_view->height!=h) {
+    view=DCNew(w,h);
+    view->flags|=DCF_NO_TRANSPARENTS;
     DCDel(g_view);
-    g_view=DCNew(w,h);
-    g_view->flags|=DCF_NO_TRANSPARENTS;
+    g_view=view;
   }
   if (RenderFaces(g_view)) {
     DrawHUD(g_win,g_sw,g_sh,g_view->width_internal);
@@ -1100,35 +1105,35 @@ U0 HolyCraft()
 {
 #ifdef TOS_NATIVE
   SettingsPush;
-  AutoComplete;
-  WinBorder;
-  WinMax;
-  DocCursor;
-  DocClear;
-//The WinMgr leaves clicks to the game, and no Ctrl drag may scroll the
-  //window: the faces would slide off the sky and the cross.
-  Fs->win_inhibit|=WIF_SELF_MS_L|WIF_SELF_MS_R|WIG_DBL_CLICK|
-	WIF_SELF_GRAB_SCROLL;
-  Init;
-  SkyRowsMake;
-//Clear keys left down from the launch command.
-  g_scw=Char2ScanCode('w'); g_scs=Char2ScanCode('s');
-  g_sca=Char2ScanCode('a'); g_scd=Char2ScanCode('d');
-  g_scr=Char2ScanCode('r'); g_scf=Char2ScanCode('f');
-  g_scj=Char2ScanCode('j'); g_scl=Char2ScanCode('l');
-  g_sci=Char2ScanCode('i'); g_sck=Char2ScanCode('k');
-  LBtr(kbd.down_bitmap,g_scw); LBtr(kbd.down_bitmap,g_scs);
-  LBtr(kbd.down_bitmap,g_sca);
-  LBtr(kbd.down_bitmap,g_scd); LBtr(kbd.down_bitmap,g_scr);
-  LBtr(kbd.down_bitmap,g_scf);
-  LBtr(kbd.down_bitmap,g_scj); LBtr(kbd.down_bitmap,g_scl);
-  LBtr(kbd.down_bitmap,g_sci);
-  LBtr(kbd.down_bitmap,g_sck);
-  FlushMsgs;
-  MsSet(320,240);
-  BrowserMouseCapture=1;
-  Fs->draw_it=&DrawIt;
   try {
+    AutoComplete;
+    WinBorder;
+    WinMax;
+    DocCursor;
+    DocClear;
+    //The WinMgr leaves clicks to the game, and no Ctrl drag may scroll the
+    //window: the faces would slide off the sky and the cross.
+    Fs->win_inhibit|=WIF_SELF_MS_L|WIF_SELF_MS_R|WIG_DBL_CLICK|
+	WIF_SELF_GRAB_SCROLL;
+    Init;
+    SkyRowsMake;
+    //Clear keys left down from the launch command.
+    g_scw=Char2ScanCode('w'); g_scs=Char2ScanCode('s');
+    g_sca=Char2ScanCode('a'); g_scd=Char2ScanCode('d');
+    g_scr=Char2ScanCode('r'); g_scf=Char2ScanCode('f');
+    g_scj=Char2ScanCode('j'); g_scl=Char2ScanCode('l');
+    g_sci=Char2ScanCode('i'); g_sck=Char2ScanCode('k');
+    LBtr(kbd.down_bitmap,g_scw); LBtr(kbd.down_bitmap,g_scs);
+    LBtr(kbd.down_bitmap,g_sca);
+    LBtr(kbd.down_bitmap,g_scd); LBtr(kbd.down_bitmap,g_scr);
+    LBtr(kbd.down_bitmap,g_scf);
+    LBtr(kbd.down_bitmap,g_scj); LBtr(kbd.down_bitmap,g_scl);
+    LBtr(kbd.down_bitmap,g_sci);
+    LBtr(kbd.down_bitmap,g_sck);
+    FlushMsgs;
+    MsSet(320,240);
+    BrowserMouseCapture=1;
+    Fs->draw_it=&DrawIt;
     while (!g_quit) {
       HandleInput;
       Sleep(16);
@@ -1139,10 +1144,11 @@ U0 HolyCraft()
   SettingsPop;
   CleanUp;
 #else
-  CDC *dc=DCAlias;
-  Init;
-  BrowserMouseCapture=1;
+  CDC *dc=NULL;
   try {
+    dc=DCAlias;
+    Init;
+    BrowserMouseCapture=1;
     while (!g_quit) {
       HandleInput;
       RenderFrame;
@@ -1152,7 +1158,7 @@ U0 HolyCraft()
     }
   } catch
     PutExcept;
-  DCFill(dc,BLACK);
+  if (dc) DCFill(dc,BLACK);
   BrowserMouseCapture=0;
   DCDel(dc);
   CleanUp;

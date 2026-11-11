@@ -106,6 +106,13 @@ a deterministic scene and reports the QEMU backend plus the path to its executio
 The timing command warms each renderer, then measures 200 spawn-view frames using guest
 `tS`; `N` changes the frame count. The baseline source must provide the native rendering API.
 
+`node tools/lifetime.test.mjs` checks seven startup and resize allocation failures in
+original TempleOS. `BACKEND=hemu` runs the same source through `TEMPLEOS_WEB`;
+`BACKEND=wasm` checks five browser startup failures. Each test denies one allocation
+at a game call boundary, tracks owned resources, and checks cleanup or retry. It
+does not inject failures inside the system's `DCNew` allocator. Resize keeps the
+previous resource until its replacement has been allocated successfully.
+
 To measure rendering on the current machine:
 
 ```sh
