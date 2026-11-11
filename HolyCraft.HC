@@ -658,7 +658,7 @@ I64 NearCut()
 
 U0 FaceFill(I64 color,I64 prob)
 {//Subpixel edges share pixel centers; reciprocal depth is linear in x,y.
-  I64 i,j,n=NearCut,x1,x2,y,y1,y2,ya,yb,z1,z2,ex,dx,*dst;
+  I64 i,j,n=NearCut,x1,x2,y,y1,y2,ya,yb,z1,z2,reg ex,reg dx,*dst;
   F64 inv,ax,ay,bx,by,a,zx=0,zy=0,z0,ymin=I32_MAX,ymax=I32_MIN,
 	slope,x,z;
   if (n<3) return;
@@ -713,14 +713,14 @@ U0 FaceFill(I64 color,I64 prob)
   g_rdc->dither_probability_u16=prob;
   for (y=y1;y<=y2;y++) {
     x1=g_left[y]; x2=g_right[y]-1;
-    if (x1<0) x1=0;
-    if (x2>=g_sw) x2=g_sw-1;
+    x1=MaxI64(x1,0);
+    x2=MinI64(x2,g_sw-1);
     if (x1<=x2) {
       z=z0+zy*y;
       z1=z+zx*x1;
       z2=z+zx*x2;
-      if (z1<0) z1=0;
-      if (z2<0) z2=0;
+      z1=MaxI64(z1,0);
+      z2=MaxI64(z2,0);
       GrHLine(g_rdc,x1,x2,y,z1,z2);
     }
   }
