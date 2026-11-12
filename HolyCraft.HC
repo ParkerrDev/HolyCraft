@@ -658,8 +658,8 @@ I64 NearCut()
 
 U0 FaceFill(I64 color,I64 prob)
 {//Subpixel edges share pixel centers; reciprocal depth is linear in x,y.
-  I64 i,j,n,x1,x2,y,y1,y2,ya,yb,z1,z2,reg ex,reg dx,*dst,
-	ymin=I64_MAX,ymax=I64_MIN;
+  I64 i,j,n,x1,x2,y,y1,y2,ya,yb,z1,z2,reg ex,reg dx,*dst,*end,
+	ymin=I64_MAX,ymax=I64_MIN,side=3;
   F64 inv,ax,ay,bx,by,a,zx=0,zy=0,z0,
 	slope,x,z,*vf,*vr,*vu;
   if (g_vf[0]>=NEAR && g_vf[1]>=NEAR &&
@@ -674,6 +674,10 @@ U0 FaceFill(I64 color,I64 prob)
   for (i=0;i<n;i++) {
     inv=1.0/vf[i];
     g_sx[i]=g_cxc+vr[i]*g_focal*inv;
+    if (side) {
+      if (g_sx[i]>=-1.0) side&=~1;
+      if (g_sx[i]<=g_sw+1.0) side&=~2;
+    }
     g_sy[i]=g_cyc-vu[i]*g_focal*inv;
     g_sz[i]=ZFAR-g_zk*inv;
     g_syi[i]=Ceil(g_sy[i]-0.5);
@@ -682,7 +686,7 @@ U0 FaceFill(I64 color,I64 prob)
   }
   y1=MaxI64(ymin,0);
   y2=MinI64(ymax-1,g_sh-1);
-  if (y1>y2) return;
+  if (side || y1>y2) return;
   for (i=1;i<n-1;i++) {
     ax=g_sx[i]-g_sx[0]; ay=g_sy[i]-g_sy[0];
     bx=g_sx[i+1]-g_sx[0]; by=g_sy[i+1]-g_sy[0];
@@ -712,8 +716,9 @@ U0 FaceFill(I64 color,I64 prob)
 	dst=g_right;
       else
 	dst=g_left;
+      end=dst+yb+1;
       dst+=ya;
-      for (y=ya;y<=yb;y++) {
+      while (dst<end) {
 	*dst++=(ex+0xFFFFFFFF)>>32;
 	ex+=dx;
       }
@@ -730,10 +735,8 @@ U0 FaceFill(I64 color,I64 prob)
     x2=MinI64(x2,g_sw-1);
     if (x1<=x2) {
       z=z0+zy*y;
-      z1=z+zx*x1;
-      z2=z+zx*x2;
-      z1=MaxI64(z1,0);
-      z2=MaxI64(z2,0);
+      z1=MaxI64(z+zx*x1,0);
+      z2=MaxI64(z+zx*x2,0);
       GrHLine(g_rdc,x1,x2,y,z1,z2);
     }
   }

@@ -19,7 +19,7 @@ export async function loadGame(exports=['Init','HandleInput']){
   if(!where)return null;
   const {compileHolyC}=await import(pathToFileURL(where+'/src/compiler.js'));
   const {createHost}=await import(pathToFileURL(where+'/src/runtime/host.js'));
-  const source=readFileSync(new URL('HolyCraft.HC',here),'latin1').replace(/HolyCraft;\s*$/,'');
+  const source=readFileSync(process.env.SRC||new URL('HolyCraft.HC',here),'latin1').replace(/HolyCraft;\s*$/,'');
   const result=compileHolyC(source,{filename:'HolyCraft.HC',lenient:false,resilient:false,exports});
   if(result.diagnostics.length||result.warnings.length)throw new Error([...result.diagnostics,...result.warnings].join('\n'));
   const typed=[];
