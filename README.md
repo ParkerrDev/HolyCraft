@@ -81,14 +81,13 @@ node --max-old-space-size=3072 tools/render/tos.mjs windows
 The native ray comparison covers 45 poses. Three browser stress poses put the eye inside a
 solid block, which the player box prevents during play; the native exposed-face renderer does
 not support those poses. Colors identify each material and face, avoiding random dither in the
-comparison. Matching pre-fog faces also have their integer reciprocal depths
-checked against the independent rays: endpoint truncation and interpolation
-flooring allow an error from -2 to 0 depth units, plus a 0.0001-unit margin for
-32.32 slope quantization and floating-point plane setup in these 640-wide views.
-This is separate from the visibility classifier's looser distance tolerance;
-it checks both displaced-nearer and displaced-farther surfaces. It does not require
-bit-identical depth buffers across different rendering algorithms.
-The native limit is 0.87 cells before fog starts because fog is selected at each block's center.
+comparison. The native renderer draws each face with TempleOS's own GrFillPoly3, which fans
+GrFillTri0 triangles from whole-pixel corners. That leaves single pixels on shared diagonals,
+as it does in TempleOS itself, so the check allows one wrong pixel in 10,000; a face that is
+missing or seen through costs whole runs of pixels (the earlier renderer failed with 2,358,992).
+`LIST=1` prints each wrong pixel. Depth is exact only at whole-pixel corners, so its error
+against the rays is reported, not asserted. Pixels are compared out to 8 cells inside the render
+distance, less 0.87 because a block's center decides whether it is drawn.
 `HLE=0` disables raster acceleration and asserts that it stayed disabled. The `windows` check
 compares DrawIt with a separately rendered view at seven sizes, including odd widths and repeated
 growth/shrink. It does not substitute for testing actual window occlusion in QEMU or on hardware.
@@ -101,14 +100,17 @@ node tools/render/qemu.mjs check
 REPEATS=3 node tools/render/qemu.mjs time /path/to/prior/HolyCraft.HC
 ```
 
-The QEMU check compares 1,320,325 pre-fog pixels against independent ray results. It uses
-a deterministic scene and reports the QEMU backend plus the path to its execution evidence.
+The QEMU check compares 1,320,325 pre-fog pixels against independent ray results, allowing
+the same diagonal pixels (at most one in 100 of a pose). It uses a deterministic scene and
+reports the QEMU backend plus the path to its execution evidence. With `TEMPLEOS_WEB` set, it
+then runs the same source and poses in HEMU and requires each frame's FNV-1a hash to equal the
+one native TempleOS printed.
 The timing command warms each renderer, then measures 200 spawn-view frames using guest
 `tS`; `N` changes the frame count. Both renderers use the same explicit camera above
 the middle terrain column. The baseline must provide the native rendering API;
 the sky-row initializer is called only when that version defines it.
 
-`node tools/lifetime.test.mjs` checks seven startup and resize allocation failures in
+`node tools/lifetime.test.mjs` checks six startup and resize allocation failures in
 original TempleOS. `BACKEND=hemu` runs the same source through `TEMPLEOS_WEB`;
 `BACKEND=wasm` checks five browser startup failures. Each test denies one allocation
 at a game call boundary, tracks owned resources, and checks cleanup or retry. It

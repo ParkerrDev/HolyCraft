@@ -1,8 +1,7 @@
 U0 ProbeEmpty()
 {
   ProbeChk(!probe_live && !g_world && !g_hm && !g_lo && !g_view &&
-	!g_depth && !g_depthcap && !g_left && !g_right && !g_edgecap &&
-	!g_skyrows && !BrowserMouseCapture);
+	!g_depth && !g_depthcap && !g_skyrows && !BrowserMouseCapture);
 }
 
 U0 ProbeExit(CTask *task)
@@ -14,7 +13,7 @@ U0 ProbeExit(CTask *task)
 U0 LifetimeProbe(Bool startup=TRUE)
 {
   I64 i,old_draw=Fs->draw_it,old_inhibit=Fs->win_inhibit,
-	old_settings=Fs->next_settings,old_depthcap,old_edgecap,*old_left;
+	old_settings=Fs->next_settings,old_depthcap;
   I32 *old_depth;
   CDC *dc,*old_view;
   CTask *task;
@@ -32,15 +31,14 @@ U0 LifetimeProbe(Bool startup=TRUE)
   }
   task=CAlloc(sizeof(CTask));
   dc=DCNew(160,96);
-  for (i=1;i<=3;i++) {
+  for (i=1;i<=2;i++) {
     probe_fail=0;
     Init;
     SkyRowsMake;
     task->pix_width=64;task->pix_height=48;
     DrawIt(task,dc);
-    ProbeChk(probe_live==7);
-    old_view=g_view;old_depth=g_depth;old_left=g_left;
-    old_depthcap=g_depthcap;old_edgecap=g_edgecap;
+    ProbeChk(probe_live==6);
+    old_view=g_view;old_depth=g_depth;old_depthcap=g_depthcap;
     task->pix_width=160;task->pix_height=96;
     probe_allocs=0;probe_fail=i;caught=FALSE;
     try
@@ -50,14 +48,12 @@ U0 LifetimeProbe(Bool startup=TRUE)
       Fs->catch_except=TRUE;
       caught=TRUE;
     }
-    ProbeChk(caught && probe_live==7 && g_left==old_left &&
-	  g_edgecap==old_edgecap);
+    ProbeChk(caught && probe_live==6 && g_depth==old_depth &&
+	  g_depthcap==old_depthcap);
     if (i==1) ProbeChk(g_view==old_view);
-    if (i<=2)
-      ProbeChk(g_depth==old_depth && g_depthcap==old_depthcap);
     probe_fail=0;
     DrawIt(task,dc);
-    ProbeChk(probe_live==7 && g_depthcap>=160*96 && g_edgecap>=96 &&
+    ProbeChk(probe_live==6 && g_depthcap>=160*96 &&
 	  g_view->width==160 && g_view->height==96 && !g_view->depth_buf);
     CleanUp;
     ProbeEmpty;

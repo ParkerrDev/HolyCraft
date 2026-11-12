@@ -14,7 +14,7 @@ const input=process.env.SRC||new URL('../HolyCraft.HC',import.meta.url),
   source=readFileSync(input,'latin1').replace(/HolyCraft;\s*$/,'').replace(/\bDCAlias\b/g,'ProbeDCAlias').replace(
     /\b(MAlloc|Free|DCNew|DCDel)\(/g,(_,name)=>'Probe'+name+'('),
   bytes=Buffer.from((backend==='wasm'?'':'#define TOS_NATIVE 1\n')+before+source+after+
-    `\nif (probe_cases!=${backend==='wasm'?5:startup?7:3}) throw('Count',TRUE);\n`,'latin1'),
+    `\nif (probe_cases!=${backend==='wasm'?5:startup?6:2}) throw('Count',TRUE);\n`,'latin1'),
   sourceSha256=createHash('sha256').update(bytes).digest('hex');
 if(backend==='qemu') {
   const compiler=holycWasm();
@@ -24,7 +24,7 @@ if(backend==='qemu') {
   console.log(JSON.stringify({...result,sourceSha256}));
   assert.equal(result.results[0].except,'');
   assert.doesNotMatch(result.results[0].out,/WARNING/);
-  assert.match(result.results[0].out,new RegExp(`Lifetime:${startup?7:3} faults, clean retries`));
+  assert.match(result.results[0].out,new RegExp(`Lifetime:${startup?6:2} faults, clean retries`));
 } else if(backend==='hemu') {
   assert(process.env.TEMPLEOS_WEB,'Set TEMPLEOS_WEB to a site checkout with built HEMU.');
   const {GuestHarness}=await import(pathToFileURL(resolve(process.env.TEMPLEOS_WEB,'tools/hemu/GuestHarness.mjs'))),

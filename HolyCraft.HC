@@ -8,7 +8,6 @@
 //fills exposed faces with subpixel spans over a depth buffer.
 #ifdef TOS_NATIVE
 #define RDIST		32.0	//Render distance, cells.
-#define FOG0		20.0	//Fog starts here and is all sky at RDIST.
 #define NEAR		0.05	//The box keeps the eye 0.2 from a block.
 #define ZFAR		1073741824.0 //Depth far away, 1<<30.
 #define SKY_LVS		32	//Dither steps between two sky colors.
@@ -53,8 +52,8 @@ F64 g_vy=0.0,g_tick_t;
 I64 g_fly=0,g_onground=0,g_quit=0;
 I64 g_ylo,g_yhi; //Bounds of blocks with exposed faces.
 #ifdef TOS_NATIVE
-I32 *g_depth=NULL; //A pixel's depth, ZFAR-g_zk/forward: linear on the screen.
-I64 g_depthcap=0,g_sw,g_sh,g_edgecap=0,*g_left=NULL,*g_right=NULL;
+I32 *g_depth=NULL; //A pixel's depth, ZFAR-ZFAR*NEAR/forward: linear on screen.
+I64 g_depthcap=0,g_sw,g_sh;
 F64 g_focal,g_cxc,g_cyc,g_zk;
 CDC *g_rdc=NULL,*g_view=NULL;
 U8 *g_skyrows=NULL; //Dithered rows between two sky colors, SKY_LVS+1 a pair.
@@ -512,13 +511,9 @@ U0 DrawHUD(U8 *b,I64 w,I64 h,I64 wi)
 }
 
 #ifdef TOS_NATIVE
-//Every corner of a face is a sum of one share for each of its coordinates,
-//so two faces that meet get the same bits for their common corners.
-F64 g_tfx[WX+1],g_trx[WX+1],g_tux[WX+1],g_tfy[WY+1],g_tuy[WY+1],
-	g_tfz[WZ+1],g_trz[WZ+1],g_tuz[WZ+1],
-	g_vf[4],g_vr[4],g_vu[4],g_wf[8],g_wr[8],g_wu[8],
-	g_pnx[5],g_pnz[5],g_pk[5],g_sx[8],g_sy[8],g_sz[8];
-I64 g_xa,g_xb,g_fog,g_fogc,g_syi[8];
+F64 g_zfar,g_cn[12],g_ca[4],g_cy[4]; //View's side planes, inside at <=0.
+//A face's corners: bit 2 the far x, bit 1 the top, bit 0 the far z.
+U8 g_corners[6*4]={0,2,3,1,4,5,7,6,0,1,5,4,2,6,7,3,0,4,6,2,1,3,7,5};
 
 U0 SkyRowsMake()
 {//Random rows that blend each pair of sky colors in SKY_LVS steps.
@@ -562,304 +557,189 @@ U0 SkyFill()
 }
 
 U0 ViewMake()
-{//Corner shares and the planes that bound the view, for this frame.
-  I64 i;
-  F64 t,th=(g_sw/2.0+2)/g_focal,tv=(g_sh/2.0+2)/g_focal,ny,ylo,yhi;
-  for (i=0;i<=WX;i++) {
-    t=i-g_cox;
-    g_tfx[i]=t*g_fwx; g_trx[i]=t*g_rgx; g_tux[i]=t*g_upx;
-  }
-  for (i=0;i<=WY;i++) {
-    t=i-g_coy;
-    g_tfy[i]=t*g_fwy; g_tuy[i]=t*g_upy;
-  }
-  for (i=0;i<=WZ;i++) {
-    t=i-g_coz;
-    g_tfz[i]=t*g_fwz; g_trz[i]=t*g_rgz; g_tuz[i]=t*g_upz;
-  }
-  ylo=g_ylo-g_coy;
-  yhi=g_yhi-g_coy;
-  for (i=0;i<5;i++) {
-    switch (i) {
-      case 0: //In front.
-	g_pnx[i]=g_fwx; g_pnz[i]=g_fwz; ny=g_fwy;
-	break;
-      case 1: //Not off the left, and so on.
-	g_pnx[i]=g_rgx+th*g_fwx; g_pnz[i]=g_rgz+th*g_fwz; ny=th*g_fwy;
-	break;
-      case 2:
-	g_pnx[i]=th*g_fwx-g_rgx; g_pnz[i]=th*g_fwz-g_rgz; ny=th*g_fwy;
-	break;
-      case 3:
-	g_pnx[i]=g_upx+tv*g_fwx; g_pnz[i]=g_upz+tv*g_fwz; ny=g_upy+tv*g_fwy;
-	break;
-      case 4:
-	g_pnx[i]=tv*g_fwx-g_upx; g_pnz[i]=tv*g_fwz-g_upz; ny=tv*g_fwy-g_upy;
-	break;
-    }
-    g_pk[i]=Max(ny*ylo,ny*yhi)-g_pnx[i]*g_cox-g_pnz[i]*g_coz+
-	  Max(g_pnx[i],0)+Max(g_pnz[i],0);
+{//The planes a pixel outside the view's sides, for this frame.
+  I64 k;
+  F64 *n=g_cn,hw=g_cxc+1.0,hh=g_cyc+1.0,ox,oz;
+  n[0]=g_rgx*g_focal-g_fwx*hw; n[1]=-g_fwy*hw; n[2]=g_rgz*g_focal-g_fwz*hw;
+  n[3]=-g_rgx*g_focal-g_fwx*hw; n[4]=n[1]; n[5]=-g_rgz*g_focal-g_fwz*hw;
+  n[6]=g_upx*g_focal-g_fwx*hh; n[7]=g_upy*g_focal-g_fwy*hh;
+  n[8]=g_upz*g_focal-g_fwz*hh;
+  n[9]=-g_upx*g_focal-g_fwx*hh; n[10]=-g_upy*g_focal-g_fwy*hh;
+  n[11]=-g_upz*g_focal-g_fwz*hh;
+  for (k=0;k<4;k++,n+=3) {//A column's corner nearest the inside of plane k.
+    if (n[0]<0) ox=1.0; else ox=0.0;
+    if (n[2]<0) oz=1.0; else oz=0.0;
+    ox-=g_cox; oz-=g_coz;
+    g_ca[k]=ox*n[0]+oz*n[2]-g_coy*n[1];
+    if (n[1]<0) g_cy[k]=n[1]; else g_cy[k]=0;
   }
 }
 
-Bool RowSpan(I64 z,F64 dz,F64 rr)
-{//The columns of row z that can hold a face in view, g_xa to g_xb.
-  I64 i;
-  F64 half=Sqrt(rr-dz*dz),c,v;
-  g_xa=ClampI64(Floor(g_cox-0.5-half),0,WX-1);
-  g_xb=ClampI64(Floor(g_cox-0.5+half)+1,0,WX-1);
-  for (i=0;i<5;i++) {
-    c=g_pk[i]+g_pnz[i]*z;
-    if (g_pnx[i]>0) {
-      v=Clamp(-c/g_pnx[i],-2.0,WX+1.0);
-      g_xa=MaxI64(g_xa,Floor(v));
-    } else if (g_pnx[i]<0) {
-      v=Clamp(-c/g_pnx[i],-2.0,WX+1.0);
-      g_xb=MinI64(g_xb,Floor(v));
-    } else if (c<0)
-      return FALSE;
-  }
-  return g_xa<=g_xb;
+I64 ProjPt(F64 x,F64 y,F64 z,CD3I32 *p)
+{//World to screen and depth. Zero if behind NEAR.
+  F64 dx,dy,dz,f,inv;
+  dx=x-g_cox; dy=y-g_coy; dz=z-g_coz;
+  f=dx*g_fwx+dy*g_fwy+dz*g_fwz;
+  if (f<NEAR) return 0;
+  inv=g_focal/f;
+  p->x=g_cxc+(dx*g_rgx+dz*g_rgz)*inv;
+  p->y=g_cyc-(dx*g_upx+dy*g_upy+dz*g_upz)*inv;
+  p->z=g_zfar-inv*g_zk;
+  return 1;
 }
 
-U0 Corner(I64 i,I64 x,I64 y,I64 z)
-{
-  g_vf[i]=g_tfx[x]+g_tfy[y]+g_tfz[z];
-  g_vr[i]=g_trx[x]+g_trz[z];
-  g_vu[i]=g_tux[x]+g_tuy[y]+g_tuz[z];
+U0 ScrPt(F64 x,F64 y,F64 f,CD3I32 *p)
+{//A point in front of NEAR, right x up y forward f, to the screen.
+  F64 inv=g_focal/f;
+  p->x=g_cxc+x*inv;
+  p->y=g_cyc-y*inv;
+  p->z=g_zfar-inv*g_zk;
 }
 
-I64 NearCut()
-{//Corners g_vf, g_vr, g_vu, cut where the face is nearer than NEAR, into g_w*.
-  I64 i,j,n=0;
-  F64 t;
+I64 NearCut(I64 x,I64 y0,I64 y1,I64 z,I64 face,CD3I32 *poly)
+{//A face across NEAR, cut there and put on the screen. Corner cnt.
+//An edge is cut from its corner in front, so two faces cut it alike.
+  I64 i,j,m,res=0;
+  F64 wx[4],wy[4],wz[4],f[4],r[4],u[4],dx,dy,dz,t;
   for (i=0;i<4;i++) {
-    j=i+1;
-    if (j==4) j=0;
-    if (g_vf[i]>=NEAR) {
-      g_wf[n]=g_vf[i]; g_wr[n]=g_vr[i]; g_wu[n]=g_vu[i]; n++;
-      if (g_vf[j]<NEAR) {
-	t=(g_vf[i]-NEAR)/(g_vf[i]-g_vf[j]);
-	g_wf[n]=NEAR;
-	g_wr[n]=g_vr[i]+t*(g_vr[j]-g_vr[i]);
-	g_wu[n]=g_vu[i]+t*(g_vu[j]-g_vu[i]);
-	n++;
+    m=g_corners[face*4+i];
+    if (m&4) wx[i]=x+1; else wx[i]=x;
+    if (m&2) wy[i]=y1+1; else wy[i]=y0;
+    if (m&1) wz[i]=z+1; else wz[i]=z;
+    dx=wx[i]-g_cox; dy=wy[i]-g_coy; dz=wz[i]-g_coz;
+    f[i]=dx*g_fwx+dy*g_fwy+dz*g_fwz;
+    r[i]=dx*g_rgx+dz*g_rgz;
+    u[i]=dx*g_upx+dy*g_upy+dz*g_upz;
+  }
+  for (i=0;i<4;i++) {
+    j=(i+1)&3;
+    if (f[i]>=NEAR) {
+      res+=ProjPt(wx[i],wy[i],wz[i],poly+res);
+      if (f[j]<NEAR) {
+	t=(f[i]-NEAR)/(f[i]-f[j]);
+	ScrPt(r[i]+t*(r[j]-r[i]),u[i]+t*(u[j]-u[i]),NEAR,poly+res++);
       }
-    } else if (g_vf[j]>=NEAR) {
-      t=(g_vf[j]-NEAR)/(g_vf[j]-g_vf[i]);
-      g_wf[n]=NEAR;
-      g_wr[n]=g_vr[j]+t*(g_vr[i]-g_vr[j]);
-      g_wu[n]=g_vu[j]+t*(g_vu[i]-g_vu[j]);
-      n++;
+    } else if (f[j]>=NEAR) {
+      t=(f[j]-NEAR)/(f[j]-f[i]);
+      ScrPt(r[j]+t*(r[i]-r[j]),u[j]+t*(u[i]-u[j]),NEAR,poly+res++);
     }
   }
-  return n;
+  return res;
 }
 
-U0 FaceFill(I64 color,I64 prob)
-{//Subpixel edges share pixel centers; reciprocal depth is linear in x,y.
-  I64 i,j,n,x1,x2,y,y1,y2,ya,yb,z1,z2,reg ex,reg dx,*dst,*end,
-	ymin=I64_MAX,ymax=I64_MIN,side=3;
-  F64 inv,ax,ay,bx,by,a,zx=0,zy=0,z0,
-	slope,x,z,*vf,*vr,*vu;
-  if (g_vf[0]>=NEAR && g_vf[1]>=NEAR &&
-	g_vf[2]>=NEAR && g_vf[3]>=NEAR) {
-    n=4;
-    vf=g_vf;vr=g_vr;vu=g_vu;
-  } else {
-    n=NearCut;
-    if (n<3) return;
-    vf=g_wf;vr=g_wr;vu=g_wu;
-  }
-  for (i=0;i<n;i++) {
-    inv=1.0/vf[i];
-    g_sx[i]=g_cxc+vr[i]*g_focal*inv;
-    if (side) {
-      if (g_sx[i]>=-1.0) side&=~1;
-      if (g_sx[i]<=g_sw+1.0) side&=~2;
-    }
-    g_sy[i]=g_cyc-vu[i]*g_focal*inv;
-    g_sz[i]=ZFAR-g_zk*inv;
-    g_syi[i]=Ceil(g_sy[i]-0.5);
-    if (g_syi[i]<ymin) ymin=g_syi[i];
-    if (g_syi[i]>ymax) ymax=g_syi[i];
-  }
-  y1=MaxI64(ymin,0);
-  y2=MinI64(ymax-1,g_sh-1);
-  if (side || y1>y2) return;
-  for (i=1;i<n-1;i++) {
-    ax=g_sx[i]-g_sx[0]; ay=g_sy[i]-g_sy[0];
-    bx=g_sx[i+1]-g_sx[0]; by=g_sy[i+1]-g_sy[0];
-    a=ax*by-ay*bx;
-    if (Abs(a)>0.000001) {
-      zx=((g_sz[i]-g_sz[0])*by-(g_sz[i+1]-g_sz[0])*ay)/a;
-      zy=(ax*(g_sz[i+1]-g_sz[0])-bx*(g_sz[i]-g_sz[0]))/a;
-      break;
-    }
-  }
-  if (i==n-1) return;
-  for (i=0;i<n;i++) {
-    j=i+1; if (j==n) j=0;
-    if (g_sy[i]!=g_sy[j]) {
-      if (g_sy[j]>g_sy[i]) {
-	ya=MaxI64(g_syi[i],0);
-	yb=MinI64(g_syi[j]-1,g_sh-1);
-      } else {
-	ya=MaxI64(g_syi[j],0);
-	yb=MinI64(g_syi[i]-1,g_sh-1);
-      }
-      slope=(g_sx[j]-g_sx[i])/(g_sy[j]-g_sy[i]);
-      x=g_sx[i]+(ya+0.5-g_sy[i])*slope-0.5;
-      ex=Floor(x*4294967296.0);
-      dx=slope*4294967296.0;
-      if (g_sy[j]>g_sy[i] ^^ a<0)
-	dst=g_right;
-      else
-	dst=g_left;
-      end=dst+yb+1;
-      dst+=ya;
-      while (dst<end) {
-	*dst++=(ex+0xFFFFFFFF)>>32;
-	ex+=dx;
-      }
-    }
-  }
-  z0=g_sz[0]-zx*(g_sx[0]-0.5)-zy*(g_sy[0]-0.5);
-  if (color.u8[0]==color.u8[2])
-    color&=~ROPF_PROBABILITY_DITHER;
-  g_rdc->color=color;
-  g_rdc->dither_probability_u16=prob;
-  for (y=y1;y<=y2;y++) {
-    x1=g_left[y]; x2=g_right[y]-1;
-    x1=MaxI64(x1,0);
-    x2=MinI64(x2,g_sw-1);
-    if (x1<=x2) {
-      z=z0+zy*y;
-      z1=MaxI64(z+zx*x1,0);
-      z2=MaxI64(z+zx*x2,0);
-      GrHLine(g_rdc,x1,x2,y,z1,z2);
-    }
-  }
-}
-
-Bool FaceMatch(I64 x,I64 y,I64 z,I64 face,I64 block)
-{//Coplanar faces may join before fog starts; their light is identical.
-  I64 c=x+WX*(z+WZ*y);
-  F64 dx=x+0.5-g_cox,dy=y+0.5-g_coy,dz=z+0.5-g_coz;
-  if (dx*dx+dy*dy+dz*dz>=FOG0*FOG0 || g_world[c]!=block)
-    return FALSE;
-  switch (face) {
-    case 0: return !g_world[c-1];
-    case 1: return !g_world[c+1];
-    case 2: return !g_world[c-WX*WZ];
-    case 3: return y==WY-1 || !g_world[c+WX*WZ];
-    case 4: return !g_world[c-WX];
-    case 5: return !g_world[c+WX];
-  }
-  return FALSE;
-}
-
-U0 CellFace(I64 x,I64 y,I64 z,I64 face,I64 block)
-{//An exposed face, joined with neighbors having the same material and light.
-  I64 col,x1=x+1,y1=y+1,k=block*6+face;
-  if (!g_fog) {
-    if (face==2 || face==3) {
-      if (x>g_xa && FaceMatch(x-1,y,z,face,block)) return;
-      while (x1<=g_xb && FaceMatch(x1,y,z,face,block))
-	x1++;
-    } else {
-      if (y>g_lo[x+WX*z] && FaceMatch(x,y-1,z,face,block)) return;
-      while (y1<=g_hm[x+WX*z] && FaceMatch(x,y1,z,face,block))
-	y1++;
-    }
-  }
+U0 FaceDraw(I64 x,I64 y0,I64 y1,I64 z,I64 face,I64 block)
+{//Face 0 -X 1 +X 2 -Y 3 +Y 4 -Z 5 +Z of cells y0 to y1, if on the screen.
+  CD3I32 poly[5];
+  F64 ax=x,ay=y0,az=z,bx=x+1,by=y1+1,bz=z+1;
+  I64 i,k,n;
   switch (face) {
     case 0:
+      n=ProjPt(ax,ay,az,poly)+ProjPt(ax,by,az,poly+1)+
+	    ProjPt(ax,by,bz,poly+2)+ProjPt(ax,ay,bz,poly+3);
+      break;
     case 1:
-      x+=face;
-      Corner(0,x,y,z); Corner(1,x,y1,z);
-      Corner(2,x,y1,z+1); Corner(3,x,y,z+1);
+      n=ProjPt(bx,ay,az,poly)+ProjPt(bx,ay,bz,poly+1)+
+	    ProjPt(bx,by,bz,poly+2)+ProjPt(bx,by,az,poly+3);
       break;
     case 2:
+      n=ProjPt(ax,ay,az,poly)+ProjPt(ax,ay,bz,poly+1)+
+	    ProjPt(bx,ay,bz,poly+2)+ProjPt(bx,ay,az,poly+3);
+      break;
     case 3:
-      y+=face-2;
-      Corner(0,x,y,z); Corner(1,x1,y,z);
-      Corner(2,x1,y,z+1); Corner(3,x,y,z+1);
+      n=ProjPt(ax,by,az,poly)+ProjPt(bx,by,az,poly+1)+
+	    ProjPt(bx,by,bz,poly+2)+ProjPt(ax,by,bz,poly+3);
       break;
     case 4:
+      n=ProjPt(ax,ay,az,poly)+ProjPt(bx,ay,az,poly+1)+
+	    ProjPt(bx,by,az,poly+2)+ProjPt(ax,by,az,poly+3);
+      break;
     case 5:
-      z+=face-4;
-      Corner(0,x,y,z); Corner(1,x+1,y,z);
-      Corner(2,x+1,y1,z); Corner(3,x,y1,z);
+      n=ProjPt(ax,ay,bz,poly)+ProjPt(ax,by,bz,poly+1)+
+	    ProjPt(bx,by,bz,poly+2)+ProjPt(bx,ay,bz,poly+3);
       break;
   }
-  if (g_fog) {
-    if (g_fthr[k]>=32768)
-      col=g_fhi[k];
-    else
-      col=g_flo[k];
-    FaceFill(ROPF_PROBABILITY_DITHER|g_fogc<<16|col,g_fog);
-  } else
-    FaceFill(ROPF_PROBABILITY_DITHER|g_fhi[k]<<16|g_flo[k],g_fthr[k]);
-}
-
-U0 FogSet(F64 d2,F64 dy)
-{//How far the block at d2, the square of its distance, has faded.
-  F64 d,s;
-  if (d2<FOG0*FOG0)
-    g_fog=0;
-  else {
-    d=Sqrt(d2);
-    g_fog=ClampI64((d-FOG0)*65536/(RDIST-FOG0),1,65535);
-    s=2.0-SKY_K*dy/d;
-    if (s>=1.5)
-      g_fogc=g_skyr[2];
-    else if (s>=0.5)
-      g_fogc=g_skyr[1];
-    else
-      g_fogc=g_skyr[0];
+  if (n==4) {//GrFillPoly3 costs: skip a face off one side of the screen.
+    if (poly[0].x<0 && poly[1].x<0 && poly[2].x<0 && poly[3].x<0)
+      return;
+    if (poly[0].x>=g_sw && poly[1].x>=g_sw && poly[2].x>=g_sw &&
+	  poly[3].x>=g_sw)
+      return;
+    if (poly[0].y<0 && poly[1].y<0 && poly[2].y<0 && poly[3].y<0)
+      return;
+    if (poly[0].y>=g_sh && poly[1].y>=g_sh && poly[2].y>=g_sh &&
+	  poly[3].y>=g_sh)
+      return;
+  } else {
+    n=NearCut(x,y0,y1,z,face,poly);
+    if (n<3) return;
+    for (i=0,k=0;i<n;i++)
+      if (poly[i].x<0) k++;
+    if (k==n) return;
+    for (i=0,k=0;i<n;i++)
+      if (poly[i].x>=g_sw) k++;
+    if (k==n) return;
+    for (i=0,k=0;i<n;i++)
+      if (poly[i].y<0) k++;
+    if (k==n) return;
+    for (i=0,k=0;i<n;i++)
+      if (poly[i].y>=g_sh) k++;
+    if (k==n) return;
   }
+  k=block*6+face; //Each pixel dithers between the shade's two colors.
+  g_rdc->color=ROPF_PROBABILITY_DITHER+g_fhi[k]<<16+g_flo[k];
+  g_rdc->dither_probability_u16=g_fthr[k];
+  GrFillPoly3(g_rdc,n,poly);
 }
 
-U0 ColFaces(I64 x,I64 z,F64 dxz2)
-{//The faces of column x,z that are open to the air and look at the eye.
-  I64 y,h,block,c=x+WX*z;
-  F64 dy,d2,far2=(RDIST+0.87)*(RDIST+0.87);
-  U8 *w;
-  h=g_hm[c];
-  y=g_lo[c];
-  w=g_world+c+WX*WZ*y;
+U0 SideRun(I64 x,I64 z,I64 face,I64 off)
+{//A column's faces on one side, a run of one block as one tall face.
+  I64 y=g_lo[x+WX*z],h=g_hm[x+WX*z],y2,block;
+  U8 *w=g_world+x+WX*z+WX*WZ*y;
   while (y<=h) {
-    if (*w) {
-      dy=y+0.5-g_coy;
-      d2=dxz2+dy*dy;
-      if (d2<far2) {
-	FogSet(d2,dy);
-	block=*w;
-	if (g_coy>y+1 && (y==WY-1 || !w[WX*WZ]))
-	  CellFace(x,y,z,3,block);
-	if (g_coy<y && y && !w[-WX*WZ])
-	  CellFace(x,y,z,2,block);
-	if (g_cox<x && x && !w[-1])
-	  CellFace(x,y,z,0,block);
-	if (g_cox>x+1 && x<WX-1 && !w[1])
-	  CellFace(x,y,z,1,block);
-	if (g_coz<z && z && !w[-WX])
-	  CellFace(x,y,z,4,block);
-	if (g_coz>z+1 && z<WZ-1 && !w[WX])
-	  CellFace(x,y,z,5,block);
+    block=*w;
+    if (block && !w[off]) {
+      y2=y;
+      while (y2<h && w[WX*WZ]==block && !w[WX*WZ+off]) {
+	y2++;
+	w+=WX*WZ;
       }
+      FaceDraw(x,y,y2,z,face,block);
+      y=y2;
     }
     y++;
     w+=WX*WZ;
   }
 }
 
+U0 ColFaces(I64 x,I64 z)
+{//The faces of column x,z that are open to the air and look at the eye.
+  I64 y=g_lo[x+WX*z],h=g_hm[x+WX*z];
+  U8 *w=g_world+x+WX*z+WX*WZ*y;
+  while (y<=h) {
+    if (*w) {
+      if (g_coy>y+1 && (y==WY-1 || !w[WX*WZ]))
+	FaceDraw(x,y,y,z,3,*w);
+      if (g_coy<y && y && !w[-WX*WZ])
+	FaceDraw(x,y,y,z,2,*w);
+    }
+    y++;
+    w+=WX*WZ;
+  }
+  if (g_cox<x && x)
+    SideRun(x,z,0,-1);
+  if (g_cox>x+1 && x<WX-1)
+    SideRun(x,z,1,1);
+  if (g_coz<z && z)
+    SideRun(x,z,4,-WX);
+  if (g_coz>z+1 && z<WZ-1)
+    SideRun(x,z,5,WX);
+}
+
 Bool RenderFaces(CDC *dc)
 {//The sky, then every face on air that looks at the eye, over a depth buffer.
-  I64 need=dc->width_internal*dc->height,x,z,*edges;
+  I64 need=dc->width_internal*dc->height,r=RDIST,xa,xb,za,zb,x,z;
   I32 *depth;
-  F64 dx,dz,rr=(RDIST+0.75)*(RDIST+0.75);
+  F64 fx,fy,fz,r0,r1,r2,r3,*n=g_cn;
   if (need<=0) return FALSE;
   if (need>g_depthcap) {
     depth=MAlloc(need*sizeof(I32));
@@ -868,31 +748,30 @@ Bool RenderFaces(CDC *dc)
     g_depthcap=need;
   }
   g_sw=dc->width; g_sh=dc->height;
-  if (g_sh>g_edgecap) {
-    edges=MAlloc(g_sh*2*sizeof(I64));
-    Free(g_left);
-    g_left=edges;
-    g_right=g_left+g_sh;
-    g_edgecap=g_sh;
-  }
   g_win=dc->body;
   g_rdc=dc;
   SetupCam;
   g_cxc=g_sw/2.0;
   g_cyc=g_sh/2.0;
   g_focal=g_sh/2.0/FOV;
-  g_zk=ZFAR*NEAR;
+  g_zfar=ZFAR;
+  g_zk=ZFAR*NEAR/g_focal;
   dc->depth_buf=g_depth;
   MemSetU32(g_depth,I32_MAX,need);
   SkyFill;
   ViewMake;
-  for (z=0;z<WZ;z++) {
-    dz=z+0.5-g_coz;
-    if (dz*dz<rr && RowSpan(z,dz,rr))
-      for (x=g_xa;x<=g_xb;x++) {
-	dx=x+0.5-g_cox;
-	ColFaces(x,z,dx*dx+dz*dz);
-      }
+  xa=MaxI64(g_bix-r,0); xb=MinI64(g_bix+r,WX-1);
+  za=MaxI64(g_biz-r,0); zb=MinI64(g_biz+r,WZ-1);
+  for (z=za;z<=zb;z++) {
+    fz=z;
+    r0=g_ca[0]+fz*n[2]; r1=g_ca[1]+fz*n[5];
+    r2=g_ca[2]+fz*n[8]; r3=g_ca[3]+fz*n[11];
+    for (x=xa,fx=xa;x<=xb;x++,fx+=1.0) {
+      fy=g_hm[x+WX*z]+1;
+      if (r0+fx*n[0]+fy*g_cy[0]<=0 && r1+fx*n[3]+fy*g_cy[1]<=0 &&
+	    r2+fx*n[6]+fy*g_cy[2]<=0 && r3+fx*n[9]+fy*g_cy[3]<=0)
+	ColFaces(x,z);
+    }
   }
   dc->depth_buf=NULL; //The buffer is ours: DCDel must not free it.
   return TRUE;
@@ -1098,7 +977,6 @@ U0 CleanUp()
   DCDel(g_view); g_view=NULL;
   Free(g_depth); g_depth=NULL; g_depthcap=0;
   Free(g_skyrows); g_skyrows=NULL;
-  Free(g_left); g_left=NULL; g_right=NULL; g_edgecap=0;
 #else
   Free(g_fb); g_fb=NULL;
 #endif
